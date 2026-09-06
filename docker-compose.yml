@@ -1,0 +1,22 @@
+services:
+  wacustom-public:
+    build: .
+    image: wacustom-public:local
+    container_name: wacustom-public
+    env_file:
+      - wacustom-public.env
+    volumes:
+      - wacustom-public-data:/app/data
+    # Port different de Wacustom self-host (7012) : les deux tournent en
+    # parallele sur la meme machine sans se gener. Bind sur la loopback —
+    # une vraie instance publique serait exposee par un reverse proxy
+    # (Traefik), jamais par ce bind directement.
+    ports:
+      - "127.0.0.1:7013:7000"
+    # Volontairement PAS rattache a sfusion_network : cette instance ne sert
+    # pas de source a l'AIOStreams local. L'y rattacher risquerait de la faire
+    # confondre avec le Wacustom de production.
+    restart: unless-stopped
+
+volumes:
+  wacustom-public-data:

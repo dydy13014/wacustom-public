@@ -1,0 +1,1871 @@
+import asyncio
+import re
+import time
+from typing import List, Dict, Optional, Tuple
+
+from fastapi.responses import FileResponse, RedirectResponse
+
+from wastream.config.settings import settings, DEBRID_ABBREVIATIONS, SOURCE_DISPLAY_NAMES
+from wastream.debrid.alldebrid import alldebrid_service
+from wastream.debrid.torbox import torbox_service
+from wastream.debrid.premiumize import premiumize_service
+from wastream.debrid.onefichier import onefichier_service
+from wastream.debrid.nzbdav import nzbdav_service
+from wastream.scrapers.darki_api.anime import anime_scraper as darki_api_anime_scraper
+from wastream.scrapers.darki_api.base import BaseDarkiAPI
+from wastream.scrapers.darki_api.movie import movie_scraper as darki_api_movie_scraper
+from wastream.scrapers.darki_api.series import series_scraper as darki_api_series_scraper
+from wastream.scrapers.wawacity.anime import anime_scraper as wawacity_anime_scraper
+from wastream.scrapers.wawacity.movie import movie_scraper as wawacity_movie_scraper
+from wastream.scrapers.wawacity.series import series_scraper as wawacity_series_scraper
+from wastream.scrapers.free_telecharger.anime import anime_scraper as free_telecharger_anime_scraper
+from wastream.scrapers.free_telecharger.movie import movie_scraper as free_telecharger_movie_scraper
+from wastream.scrapers.free_telecharger.series import series_scraper as free_telecharger_series_scraper
+from wastream.scrapers.wasource.anime import anime_scraper as wasource_anime_scraper
+from wastream.scrapers.wasource.movie import movie_scraper as wasource_movie_scraper
+from wastream.scrapers.wasource.series import series_scraper as wasource_series_scraper
+from wastream.scrapers.movix.anime import anime_scraper as movix_anime_scraper
+from wastream.scrapers.movix.base import BaseMovix
+from wastream.scrapers.movix.movie import movie_scraper as movix_movie_scraper
+from wastream.scrapers.movix.series import series_scraper as movix_series_scraper
+from wastream.scrapers.webshare.anime import anime_scraper as webshare_anime_scraper
+from wastream.scrapers.webshare.movie import movie_scraper as webshare_movie_scraper
+from wastream.scrapers.webshare.series import series_scraper as webshare_series_scraper
+from wastream.scrapers.zone_telechargement.anime import anime_scraper as zone_telechargement_anime_scraper
+from wastream.scrapers.zone_telechargement.movie import movie_scraper as zone_telechargement_movie_scraper
+from wastream.scrapers.zone_telechargement.series import series_scraper as zone_telechargement_series_scraper
+from wastream.scrapers.torznab.trackers import yggreborn_scraper, tr4ker_scraper, torr9_scraper, c411_scraper, v3x_scraper, gemini_scraper, generationfree_scraper
+from wastream.scrapers.zilean.base import zilean_scraper
+from wastream.scrapers.nyaa.base import nyaa_scraper
+from wastream.scrapers.lumio.base import lumio_scraper, SOURCE_LABEL as LUMIO_LABEL
+from wastream.services.kitsu import kitsu_service
+from wastream.services.tmdb import tmdb_service
+from wastream.utils.cache import get_cache, get_cache_with_status, get_cache_parallel, set_cache, set_cache_if_not_exists
+from wastream.services.remote import fetch_remote_cache
+from wastream.services.health import is_source_online
+from wastream.utils.database import SearchLock, mark_dead_link, check_dead_links_batch, database
+from wastream.utils.filters import apply_all_filters, filter_excluded_keywords, filter_archive_files
+from wastream.utils.helpers import (
+    encode_config_to_base64, encode_playback_token, quote_path_segment,
+    deduplicate_and_sort_results, get_debrid_api_key, get_debrid_services,
+    should_enable_full_season, parse_size_to_bytes, get_lumio_manifest_id
+)
+from wastream.utils.languages import MULTI_LANGUAGE_PREFIX, MULTI_PREFIX_LENGTH
+from wastream.utils.logger import stream_logger, metadata_logger
+from wastream.utils.quality import quality_sort_key, extract_resolution
+from wastream.utils.urls import canonicalize_url
+from wastream.utils.validators import extract_media_info
+from wastream.utils.tasks import lancer_tache
+
+
+# ===========================
+# Playback Sentinels
+# ===========================
+PLAYBACK_SENTINELS = ("LINK_DOWN", "RETRY_ERROR", "FATAL_ERROR", "LINK_UNCACHED")
+
+
+# ===========================
+# Playback Sentinels
+# ===========================
+PLAYBACK_SENTINELS = ("LINK_DOWN", "RETRY_ERROR", "FATAL_ERROR", "LINK_UNCACHED")
+
+
+# Si le verrou anti-doublon (SearchLock) n'est pas obtenu après
+# SCRAPE_WAIT_TIMEOUT (8s), un autre worker est probablement en train de
+# scraper la même clé (jusqu'à SCRAPE_LOCK_TTL=60s). Plutôt que de dupliquer
+# immédiatement ce scrape — ce qui ajoute de la charge sur une source déjà
+# lente et peut faire dépasser le budget de l'appelant (20s côté AIOStreams)
+# — on patiente encore un peu en revérifiant le cache, pour récupérer le
+# résultat du worker en cours au lieu de refaire le travail.
+_LOCK_MISS_POLL_ATTEMPTS = 4
+_LOCK_MISS_POLL_INTERVAL = 1.5
+
+
+# ===========================
+# Stream Service Class
+# ===========================
+class StreamService:
+    """Core service that orchestrates content search, cache, debrid enrichment, and stream formatting."""
+
+    def _parse_kitsu_override_entry(self, entry: str) -> Optional[Tuple[str, int, Optional[int]]]:
+        if "=" not in entry:
+            return None
+        kitsu_id, season_part = entry.split("=", 1)
+        kitsu_id = kitsu_id.strip()
+        if "-" in season_part:
+            season_str, part_str = season_part.split("-", 1)
+            return (kitsu_id, int(season_str), int(part_str))
+        else:
+            return (kitsu_id, int(season_part), None)
+
+    def _check_kitsu_imdb_override(self, kitsu_id: str) -> Optional[Dict]:
+        for mapping in settings.KITSU_IMDB_OVERRIDE:
+            if ":" not in mapping:
+                continue
+            kitsu_ids_part, imdb_id = mapping.rsplit(":", 1)
+            entries = [e.strip() for e in kitsu_ids_part.split(",")]
+
+            all_parsed = []
+            found_entry = None
+
+            for entry in entries:
+                parsed = self._parse_kitsu_override_entry(entry)
+                if parsed:
+                    all_parsed.append(parsed)
+                    if parsed[0] == kitsu_id:
+                        found_entry = parsed
+
+            if found_entry:
+                kid, season, part = found_entry
+                previous_parts = []
+                if part and part > 1:
+                    for p_kid, p_season, p_part in all_parsed:
+                        if p_season == season and p_part and p_part < part:
+                            previous_parts.append(p_kid)
+                    previous_parts.sort(key=lambda x: next((p[2] for p in all_parsed if p[0] == x), 0))
+
+                stream_logger.debug(f"Kitsu override: {kitsu_id} → {imdb_id} S{season}" + (f"-P{part}" if part else ""))
+                return {
+                    "imdb_id": imdb_id,
+                    "season": season,
+                    "part": part,
+                    "previous_parts_kitsu_ids": previous_parts
+                }
+        return None
+
+    async def _get_episode_offset_from_previous_parts(self, previous_parts_kitsu_ids: List[str]) -> int:
+        total_episodes = 0
+        for kitsu_id in previous_parts_kitsu_ids:
+            try:
+                season_info = await kitsu_service._get_season_info(kitsu_id)
+                if season_info and season_info.get("episodes"):
+                    episodes = season_info["episodes"]
+                    total_episodes += episodes
+                    stream_logger.debug(f"Kitsu {kitsu_id}: {episodes} episodes")
+            except Exception as e:
+                stream_logger.error(f"Failed to get episodes for {kitsu_id}: {type(e).__name__}: {e}")
+        return total_episodes
+
+    def _get_debrid_service(self, service_name: str):
+        if service_name == "torbox":
+            return torbox_service
+        elif service_name == "premiumize":
+            return premiumize_service
+        elif service_name == "1fichier":
+            return onefichier_service
+        elif service_name == "nzbdav":
+            return nzbdav_service
+        else:
+            return alldebrid_service
+
+    def _get_default_sources_for_service(self, service_name: str) -> List[str]:
+        if service_name == "torbox":
+            return settings.TORBOX_SUPPORTED_SOURCES
+        elif service_name == "premiumize":
+            return settings.PREMIUMIZE_SUPPORTED_SOURCES
+        elif service_name == "1fichier":
+            return settings.ONEFICHIER_SUPPORTED_SOURCES
+        elif service_name == "nzbdav":
+            return settings.NZBDAV_SUPPORTED_SOURCES
+        else:
+            return settings.ALLDEBRID_SUPPORTED_SOURCES
+
+    def _get_sources_for_service(self, service_name: str, service_entry: Dict = None) -> List[str]:
+        if service_entry and "sources" in service_entry and service_entry["sources"]:
+            return service_entry["sources"]
+        return self._get_default_sources_for_service(service_name)
+
+    def _get_default_hosts_for_service(self, service_name: str) -> List[str]:
+        if service_name == "torbox":
+            return settings.TORBOX_SUPPORTED_HOSTS
+        elif service_name == "premiumize":
+            return settings.PREMIUMIZE_SUPPORTED_HOSTS
+        elif service_name == "1fichier":
+            return settings.ONEFICHIER_SUPPORTED_HOSTS
+        else:
+            return settings.ALLDEBRID_SUPPORTED_HOSTS
+
+    def _get_hosts_for_service(self, service_name: str, service_entry: Dict = None) -> List[str]:
+        if service_entry and "hosts" in service_entry and service_entry["hosts"]:
+            return service_entry["hosts"]
+        return self._get_default_hosts_for_service(service_name)
+
+    def _get_supported_sources(self, config: Dict) -> List[str]:
+        debrid_services = get_debrid_services(config)
+        if not debrid_services:
+            return settings.ALLDEBRID_SUPPORTED_SOURCES
+
+        all_sources = set()
+        for service_entry in debrid_services:
+            service_name = service_entry.get("service", "alldebrid")
+            all_sources.update(self._get_sources_for_service(service_name, service_entry))
+
+        return list(all_sources)
+
+    async def _check_cache_and_enrich(
+        self,
+        results: List[Dict],
+        debrid_services: List[Dict],
+        config: Dict,
+        timeout_remaining: float,
+        season: Optional[str] = None,
+        episode: Optional[str] = None
+    ) -> List[Dict]:
+        if not debrid_services:
+            return []
+
+        source_mapping = SOURCE_DISPLAY_NAMES
+
+        async def check_single(service_entry):
+            service_name = service_entry.get("service", "alldebrid")
+            api_key = service_entry.get("api_key", "")
+            debrid_service = self._get_debrid_service(service_name)
+
+            supported_sources = self._get_sources_for_service(service_name, service_entry)
+            allowed_sources = [source_mapping.get(s, s) for s in supported_sources]
+            # Compatibilite : Lumio n'etait pas proposee dans l'interface avant
+            # sa publication, elle est donc absente des listes de sources
+            # enregistrees a cette epoque. Sans ce repli, ses resultats — les
+            # seuls garantis deja en cache debrid — seraient rejetes ici alors
+            # qu'ils ont bien ete recuperes. A retirer une fois les configs
+            # existantes re-enregistrees depuis la nouvelle interface.
+            if get_lumio_manifest_id(config) and LUMIO_LABEL not in allowed_sources:
+                allowed_sources.append(LUMIO_LABEL)
+
+            filtered_results = [
+                r.copy() for r in results
+                if r.get("source") in allowed_sources
+            ]
+
+            if not filtered_results:
+                return []
+
+            user_hosts = self._get_hosts_for_service(service_name, service_entry)
+
+            service_config = {
+                **config,
+                "enable_nzb": service_entry.get("enable_nzb", False),
+                "enable_full_season": service_entry.get("enable_full_season", False)
+            }
+
+            enriched = await debrid_service.check_cache_and_enrich(
+                filtered_results, api_key, service_config, timeout_remaining, season, episode, user_hosts
+            )
+
+            for r in enriched:
+                r["debrid_service"] = service_name
+
+            return enriched
+
+        tasks = [check_single(entry) for entry in debrid_services]
+        all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        merged_results = []
+        for idx, result in enumerate(all_results):
+            if isinstance(result, list):
+                merged_results.extend(result)
+            elif isinstance(result, Exception):
+                service_name = debrid_services[idx].get("service", "unknown")
+                stream_logger.error(f"Cache check failed for {service_name}: {type(result).__name__}: {result}")
+
+        merged_results.sort(key=quality_sort_key)
+
+        return merged_results
+
+    async def _format_streams(
+        self,
+        results: List[Dict],
+        config: Dict,
+        base_url: str,
+        season: Optional[str],
+        episode: Optional[str],
+        year: Optional[str],
+        content_type: Optional[str] = None
+    ) -> List[Dict]:
+        streams = []
+        dead_links_count = 0
+
+        all_links = [r.get("link") for r in results if r.get("link")]
+        dead_links_map = await check_dead_links_batch(all_links)
+
+        resilient_config = self._get_resilient_config(config)
+        if resilient_config["enabled"]:
+            excluded_keywords = config.get("excluded_keywords", [])
+            live_results = [
+                r for r in results
+                if r.get("link") and not dead_links_map.get(r.get("link"))
+                and not (r.get("model_type") == "nzb" and not is_source_online(r.get("source", "")))
+                and not self._is_archive_result(r)
+                and not self._matches_excluded_keyword(r, excluded_keywords)
+            ]
+            live_results.sort(key=lambda r: 0 if r.get("cache_status") == "cached" else 1)
+        else:
+            live_results = []
+
+        for result in results:
+            link = result.get("link")
+            if not link:
+                continue
+
+            if dead_links_map.get(link):
+                dead_links_count += 1
+                continue
+
+            if result.get("model_type") == "nzb" and not is_source_online(result.get("source", "")):
+                continue
+
+            quality = result.get("quality", "Unknown")
+            language = result.get("language", "Unknown")
+            hoster = result.get("hoster", "Unknown")
+            size = result.get("size", "Unknown")
+            display_name = result.get("display_name", "Unknown")
+            episode_num = result.get("episode") if result.get("episode") is not None else episode
+            season_num = result.get("season") if result.get("season") is not None else season
+
+            service_name = result.get("debrid_service", "alldebrid")
+            service_abbr = DEBRID_ABBREVIATIONS.get(service_name, "AD")
+
+            debrid_filename = result.get("debrid_filename")
+            if debrid_filename and debrid_filename.strip():
+                if not (debrid_filename.startswith("Unknown") and debrid_filename.endswith("Link")):
+                    display_name = debrid_filename
+
+            user_languages = config.get("languages", [])
+            if user_languages and language.startswith(MULTI_LANGUAGE_PREFIX.title()) and language.endswith(")"):
+                multi_langs = language[MULTI_PREFIX_LENGTH:-1]
+                multi_langs_list = [lang.strip() for lang in multi_langs.split(",")]
+
+                filtered_langs = [lang for lang in multi_langs_list if lang in user_languages]
+
+                if filtered_langs:
+                    filtered_multi = f"Multi ({', '.join(filtered_langs)})"
+                    language = filtered_multi
+
+                    if "Multi (" in display_name and ")" in display_name:
+                        pattern = r"Multi \([^)]+\)"
+                        display_name = re.sub(pattern, filtered_multi, display_name)
+
+            cache_status = result.get("cache_status", "uncached")
+            cache_emoji = "⚡" if cache_status == "cached" else "⏳"
+
+            token_data = {"l": link, "s": service_name}
+
+            user_uuid = config.get("_user_uuid")
+            enc_password = config.get("_enc_password")
+
+            if user_uuid and enc_password:
+                token_data["u"] = user_uuid
+                token_data["p"] = enc_password
+            else:
+                token_data["c"] = encode_config_to_base64(config)
+
+            source = result.get("source", "")
+            if source:
+                token_data["so"] = source
+            if season_num:
+                token_data["se"] = season_num
+            if episode_num:
+                token_data["ep"] = episode_num
+            if content_type:
+                token_data["ct"] = content_type
+            hoster = result.get("hoster", "")
+            if hoster:
+                token_data["h"] = hoster
+            if service_name == "nzbdav" and display_name and display_name != "Unknown":
+                token_data["t"] = display_name
+
+            if resilient_config["enabled"]:
+                fallback_candidates = self._build_fallback_candidates(result, live_results, resilient_config)
+                if fallback_candidates:
+                    token_data["a"] = fallback_candidates
+
+            token = encode_playback_token(token_data)
+            if len(token) > settings.RESILIENT_TOKEN_MAX_BYTES and "a" in token_data:
+                del token_data["a"]
+                token = encode_playback_token(token_data)
+            filename = quote_path_segment(display_name) if display_name and display_name != "Unknown" else "stream"
+            playback_url = f"{base_url}/playback/{token}/{filename}"
+
+            resolution = extract_resolution(quality)
+            resolution_line = f"\n{resolution}" if resolution and resolution != "Unknown" else ""
+            stream_name = f"[{service_abbr} {cache_emoji}]\n{settings.ADDON_NAME}{resolution_line}"
+
+            description_parts = []
+            if language and language != "Unknown":
+                description_parts.append(f"🌍 {language}")
+            if quality and quality != "Unknown":
+                description_parts.append(f"🎞️ {quality}")
+
+            size_year_parts = []
+            if size and size != "Unknown":
+                size_year_parts.append(f"📦 {size}")
+            if year:
+                size_year_parts.append(f"📅 {year}")
+            if size_year_parts:
+                description_parts.append(" ".join(size_year_parts))
+
+            source = result.get("source", "Wawacity")
+            source_line = f"🌐 {source}"
+
+            if hoster and hoster != "Unknown":
+                source_line += f" ☁️ {hoster}"
+
+            if source_line:
+                description_parts.append(source_line)
+
+            if display_name and display_name != "Unknown":
+                description_parts.append(f"📁 {display_name}")
+
+            q_key = quality_sort_key(result)
+            size_bytes = parse_size_to_bytes(size)
+            lang_priority = 0 if language != "Unknown" else 1
+
+            # Sub-priority for French Audio vs VOSTFR
+            french_sub_priority = 0
+            if config.get("prioritize_vff_multi", False) and language == "French":
+                display_name_upper = display_name.upper() if display_name else ""
+                is_vostfr = any(tag in display_name_upper for tag in ["VOSTFR", "SUBFRENCH", "SUBFR", ".SUB."])
+                is_audio = any(tag in display_name_upper for tag in ["VFF", "MULTI", "VF", "TRUEFRENCH"])
+                if is_audio and not is_vostfr:
+                    french_sub_priority = 0
+                elif is_vostfr:
+                    french_sub_priority = 1
+
+            # Preferred keywords (symmetric to excluded_keywords) : contenus
+            # correspondant à un mot-clé libre (ex. MULTI, TRUEFRENCH) classés
+            # avant le reste, sans les exclure comme excluded_keywords le fait.
+            preferred_keywords = config.get("preferred_keywords", [])
+            preferred_priority = 0
+            if preferred_keywords:
+                match_text = (display_name or "").lower()
+                preferred_priority = 0 if any(kw.lower() in match_text for kw in preferred_keywords) else 1
+
+            # Stream type priority (DDL/NZB vs Torrent)
+            is_torrent = (result.get("model_type") == "torrent")
+            pref = config.get("stream_type_preference", "ddl_first")
+            if pref == "torrent_first":
+                stream_type_priority = 0 if is_torrent else 1
+            else:  # ddl_first
+                stream_type_priority = 1 if is_torrent else 0
+
+            streams.append({
+                "name": stream_name,
+                "description": "\r\n".join(description_parts),
+                "behaviorHints": {
+                    "filename": display_name
+                },
+                "url": playback_url,
+                "_sort_values": {
+                    "cached": 0 if cache_status == "cached" else 1,
+                    "preferred": preferred_priority,
+                    "resolution": q_key[0],
+                    "size": -size_bytes,
+                    "release_type": q_key[1],
+                    "language": (lang_priority, french_sub_priority, language),
+                    "stream_type": stream_type_priority,
+                },
+            })
+
+        default_sort_order = ["cached", "preferred", "resolution", "size", "release_type", "language", "stream_type"]
+        valid_keys = set(default_sort_order)
+        sort_order = config.get("sort_order") or default_sort_order
+        sort_order = [k for k in sort_order if k in valid_keys]
+        for k in default_sort_order:
+            if k not in sort_order:
+                sort_order.append(k)
+
+        # If user has a non-default stream_type_preference and stream_type is at the
+        # tail of the order (i.e. wasn't manually moved up), promote it to right
+        # after "cached" so the preference is the dominant secondary criterion.
+        stream_type_pref = config.get("stream_type_preference", "ddl_first")
+        if stream_type_pref != "ddl_first" and "stream_type" in sort_order:
+            st_idx = sort_order.index("stream_type")
+            cached_idx = sort_order.index("cached") if "cached" in sort_order else -1
+            # Only auto-promote if the user left stream_type near the end
+            # (i.e. they haven't manually dragged it up above language/resolution)
+            if st_idx > (cached_idx + 1):
+                sort_order.pop(st_idx)
+                sort_order.insert(cached_idx + 1, "stream_type")
+
+        streams.sort(key=lambda s: tuple(s["_sort_values"][k] for k in sort_order))
+
+        for s in streams:
+            del s["_sort_values"]
+
+        stream_logger.debug(f"Skipped {dead_links_count} dead links")
+        stream_logger.debug(f"Returning {len(streams)} stream(s)")
+        return streams
+
+    async def get_streams(self, content_type: str, content_id: str,
+                          config: Dict, base_url: str) -> List[Dict]:
+        start_time = time.time()
+
+        media_info = extract_media_info(content_id, content_type)
+
+        if media_info.get("kitsu_id"):
+            override = self._check_kitsu_imdb_override(media_info["kitsu_id"])
+            if override:
+                media_info["imdb_id"] = override["imdb_id"]
+                media_info["season"] = str(override["season"])
+
+                episode = int(media_info.get("episode", 1))
+                if override["previous_parts_kitsu_ids"]:
+                    offset = await self._get_episode_offset_from_previous_parts(override["previous_parts_kitsu_ids"])
+                    episode = offset + episode
+                    stream_logger.debug(f"Episode with offset: {offset} + {media_info.get('episode')} = {episode}")
+                media_info["episode"] = str(episode)
+
+                content_type = "series"
+            else:
+                return await self._handle_kitsu_request(media_info, config, base_url, start_time)
+
+        metadata = await self._get_metadata(
+            media_info["imdb_id"],
+            config.get("tmdb_api_token", "")
+        )
+
+        if not metadata:
+            stream_logger.error(f"TMDB metadata failed for {media_info['imdb_id']}")
+            return []
+
+        search_config = {
+            **config,
+            "enable_full_season": should_enable_full_season(config)
+        }
+
+        results = await self._search_content(
+            metadata["title"],
+            metadata.get("year"),
+            content_type,
+            media_info.get("season"),
+            media_info.get("episode"),
+            metadata.get("enhanced"),
+            search_config
+        )
+
+        # Titres alternatifs : essayés en plus du titre principal si celui-ci
+        # a ramené peu de résultats — certains trackers n'indexent un contenu
+        # que sous un titre précis (ex. C411 = "Seuls face à l'Alaska" en
+        # français uniquement, jamais "Mountain Men"). Cas réel (2026-07-20) :
+        # un gate "if not results" cachait totalement cette tentative dès
+        # qu'UN SEUL autre tracker répondait déjà quelque chose avec le titre
+        # principal — C411 n'avait alors jamais sa chance avec le titre FR.
+        # Mais "toujours" essayer (peu importe le nombre de résultats déjà
+        # trouvés) fait exploser la charge sur un blockbuster à cache froid
+        # (5+ titres traduits TMDB × tout le pipeline de sources en
+        # parallèle) → timeout côté AIOStreams observé sur Doctor Strange 2
+        # (2026-07-20). Seuil pragmatique : le titre principal a déjà de quoi
+        # proposer un choix correct au-delà de ce nombre, l'exhaustivité
+        # cross-titre ne vaut plus le coût en charge/latence.
+        ALT_TITLE_RESULT_THRESHOLD = 15
+        alt_titles = [
+            t for t in (metadata.get("enhanced") or {}).get("titles", [])
+            if t != metadata["title"]
+        ] if len(results) < ALT_TITLE_RESULT_THRESHOLD else []
+        if alt_titles:
+            alt_results_list = await asyncio.gather(*(
+                self._search_content(
+                    alt_title,
+                    metadata.get("year"),
+                    content_type,
+                    media_info.get("season"),
+                    media_info.get("episode"),
+                    metadata.get("enhanced"),
+                    search_config
+                )
+                for alt_title in alt_titles
+            ))
+            for alt_title, alt_results in zip(alt_titles, alt_results_list):
+                if alt_results:
+                    stream_logger.debug(f"Titre alternatif '{alt_title}' : {len(alt_results)} résultat(s) en plus")
+                    results = results + alt_results
+
+        if not results:
+            stream_logger.debug(f"No content: '{metadata['title']}' ({metadata.get('year', 'Unknown')})")
+            return []
+
+        results = deduplicate_and_sort_results(results, quality_sort_key)
+
+        results = apply_all_filters(results, config, content_type)
+
+        elapsed = time.time() - start_time
+        timeout = config.get("stream_request_timeout", settings.STREAM_REQUEST_TIMEOUT)
+        remaining_time = max(0, timeout - elapsed)
+
+        debrid_services = get_debrid_services(config)
+        enriched_results = await self._check_cache_and_enrich(
+            results, debrid_services, config, remaining_time,
+            media_info.get("season"), media_info.get("episode")
+        )
+
+        streams = await self._format_streams(
+            enriched_results,
+            config,
+            base_url,
+            media_info.get("season"),
+            media_info.get("episode"),
+            metadata.get("year"),
+            content_type
+        )
+
+        streams = filter_archive_files(streams)
+
+        excluded_keywords = config.get("excluded_keywords", [])
+        if excluded_keywords:
+            filtered_streams = filter_excluded_keywords(streams, excluded_keywords)
+            excluded_count = len(streams) - len(filtered_streams)
+            if excluded_count > 0:
+                stream_logger.debug(f"Excluded {excluded_count} streams")
+            streams = filtered_streams
+
+        return streams
+
+    async def _get_metadata(self, imdb_id: str, tmdb_api_token: str) -> Optional[Dict]:
+        if not tmdb_api_token or not tmdb_api_token.strip():
+            stream_logger.error("No TMDB token")
+            return None
+
+        try:
+            enhanced_metadata = await tmdb_service.get_enhanced_metadata(imdb_id, tmdb_api_token)
+            if enhanced_metadata:
+                return {
+                    "title": enhanced_metadata["titles"][0] if enhanced_metadata["titles"] else "",
+                    "year": enhanced_metadata["year"],
+                    "type": enhanced_metadata["type"],
+                    "enhanced": enhanced_metadata
+                }
+
+            return await tmdb_service.get_metadata(imdb_id, tmdb_api_token)
+
+        except Exception as e:
+            stream_logger.error(f"Metadata fetch error: {type(e).__name__}: {e}")
+            return None
+
+    async def _search_content(self, title: str, year: Optional[str],
+                              content_type: str, season: Optional[str],
+                              episode: Optional[str], metadata: Optional[Dict] = None, config: Dict = None) -> List[Dict]:
+        if metadata and metadata.get("content_type") == "anime":
+            return await self._search_anime(title, year, season, episode, metadata, config)
+        elif content_type == "series":
+            return await self._search_series(title, year, season, episode, metadata, config)
+        else:
+            return await self._search_movie(title, year, metadata, config)
+
+    async def _search_source_with_cache(
+        self,
+        source_name: str,
+        content_type: str,
+        do_search,
+        title: str,
+        year: Optional[str],
+        season: Optional[str] = None,
+        episode: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+        use_episode_key: bool = False,
+        filter_episodes: bool = True
+    ) -> List[Dict]:
+        """Generic cached search with lock, remote fallback, and background refresh."""
+        if use_episode_key and season and episode:
+            base_types = {"series": "series", "anime": "anime"}
+            base_type = base_types.get(content_type, content_type)
+            cache_type = f"{source_name}_{base_type}_s{season}e{episode}"
+        else:
+            type_map = {"movies": "movie", "series": "series", "anime": "anime"}
+            mapped_type = type_map.get(content_type, content_type)
+            cache_type = f"{source_name}_{mapped_type}"
+
+        # Build lock type (always at the content_type level, not per-episode)
+        lock_map = {"movies": "movie", "series": "series", "anime": "anime"}
+        lock_type = f"{source_name}_{lock_map.get(content_type, content_type)}"
+
+        if use_episode_key and (not season or not episode):
+            try:
+                return await do_search()
+            except Exception as e:
+                stream_logger.error(f"{source_name} search failed: {type(e).__name__}: {e}")
+                return []
+
+        def _maybe_filter(results):
+            if filter_episodes and results:
+                return self._filter_episode_results(results, season, episode, content_type, metadata)
+            return results
+
+        async def _background_refresh():
+            try:
+                stream_logger.debug(f"Background refresh: {cache_type} {title} ({year})")
+                results = await do_search()
+                if results:
+                    await set_cache(database, cache_type, title, year, results, settings.CONTENT_CACHE_TTL)
+                    stream_logger.debug(f"Background refresh done: {len(results)} results")
+            except Exception as e:
+                stream_logger.error(f"Background refresh failed: {type(e).__name__}: {e}")
+
+        if settings.CONTENT_CACHE_MODE == "live":
+            cached_results, is_valid = await get_cache_with_status(database, cache_type, title, year)
+
+            if cached_results is not None and is_valid:
+                lancer_tache(_background_refresh())
+                return _maybe_filter(cached_results)
+
+            if cached_results is None:
+                remote_result = await fetch_remote_cache(cache_type, title, year)
+                if isinstance(remote_result, tuple):
+                    remote_data, should_store = remote_result
+                    if remote_data:
+                        if should_store:
+                            await set_cache_if_not_exists(database, cache_type, title, year, remote_data, settings.CONTENT_CACHE_TTL)
+                        lancer_tache(_background_refresh())
+                        return _maybe_filter(remote_data)
+
+            async with SearchLock(lock_type, title, year) as lock:
+                cached_results = await get_cache(database, cache_type, title, year)
+                if cached_results is not None:
+                    return _maybe_filter(cached_results)
+
+                if not lock.acquired:
+                    for _ in range(_LOCK_MISS_POLL_ATTEMPTS):
+                        await asyncio.sleep(_LOCK_MISS_POLL_INTERVAL)
+                        cached_results = await get_cache(database, cache_type, title, year)
+                        if cached_results is not None:
+                            return _maybe_filter(cached_results)
+
+                results = await do_search()
+
+                if results:
+                    await set_cache(database, cache_type, title, year, results, settings.CONTENT_CACHE_TTL)
+
+                return _maybe_filter(results)
+
+        # Background cache mode (default)
+        async with SearchLock(lock_type, title, year) as lock:
+            cached_results, should_store = await get_cache_parallel(database, cache_type, title, year)
+            if cached_results is not None:
+                stream_logger.debug(f"Using cached results for {content_type}")
+                if should_store:
+                    await set_cache_if_not_exists(database, cache_type, title, year, cached_results, settings.CONTENT_CACHE_TTL)
+                return _maybe_filter(cached_results)
+
+            if not lock.acquired:
+                for _ in range(_LOCK_MISS_POLL_ATTEMPTS):
+                    await asyncio.sleep(_LOCK_MISS_POLL_INTERVAL)
+                    cached_results, _ = await get_cache_parallel(database, cache_type, title, year)
+                    if cached_results is not None:
+                        return _maybe_filter(cached_results)
+
+            results = await do_search()
+
+            if results:
+                await set_cache(database, cache_type, title, year, results, settings.CONTENT_CACHE_TTL)
+
+            return _maybe_filter(results)
+
+    async def _search_darki_api_with_kitsu_direct_mapping(
+        self,
+        title: str,
+        year: Optional[str],
+        metadata: Dict,
+        absolute_episode: int,
+        config: Optional[Dict] = None
+    ) -> List[Dict]:
+        """Map Kitsu absolute episode to Darki-API season/episode and search."""
+        try:
+            darki_api_kitsu_metadata = {
+                "titles": metadata.get("titles", [title]),
+                "year": year
+            }
+
+            metadata_logger.debug("Kitsu→Darki: searching anime")
+
+            darki_api_scraper = BaseDarkiAPI()
+            search_titles = darki_api_kitsu_metadata.get("titles", [title])
+            darki_api_result = await darki_api_scraper.search_by_titles(search_titles, darki_api_kitsu_metadata)
+
+            if not darki_api_result:
+                metadata_logger.debug("Kitsu→Darki: anime not found")
+                return []
+
+            title_id = darki_api_result.get("id")
+
+            if not title_id:
+                metadata_logger.error("Kitsu→Darki: no title ID")
+                return []
+
+            metadata_logger.debug(f"Kitsu→Darki: mapping episode {absolute_episode}")
+
+            tmdb_api_token = config.get("tmdb_api_token") if config else None
+
+            darki_mapping = await darki_api_scraper.map_kitsu_absolute_to_darki_season(
+                title_id, absolute_episode, tmdb_api_token
+            )
+
+            if not darki_mapping:
+                metadata_logger.error("Kitsu→Darki: mapping failed")
+                return []
+
+            darki_season, darki_episode = darki_mapping
+
+            metadata_logger.debug(f"Kitsu→Darki: S{darki_season}E{darki_episode}")
+
+            return await self._search_source_with_cache(
+                "darki_api", "anime",
+                lambda: darki_api_anime_scraper.search(title, year, darki_api_kitsu_metadata, darki_season, darki_episode, config),
+                title, year, darki_season, darki_episode,
+                darki_api_kitsu_metadata, use_episode_key=True, filter_episodes=False
+            )
+
+        except Exception as e:
+            metadata_logger.error(f"Kitsu→Darki error: {type(e).__name__}: {e}")
+            return []
+
+    async def _search_movix_with_kitsu_direct_mapping(
+        self,
+        title: str,
+        year: Optional[str],
+        metadata: Dict,
+        absolute_episode: int,
+        config: Optional[Dict] = None
+    ) -> List[Dict]:
+        """Map Kitsu absolute episode to Movix season/episode and search."""
+        try:
+            search_titles = metadata.get("titles", [title])
+            movix_kitsu_metadata = {
+                "titles": search_titles,
+                "original_titles": search_titles,
+                "all_titles": metadata.get("all_titles", search_titles),
+                "year": year
+            }
+
+            metadata_logger.debug("Kitsu→Movix: searching anime")
+
+            movix_scraper = BaseMovix()
+            movix_result = await movix_scraper.search_by_titles(search_titles, movix_kitsu_metadata)
+
+            if not movix_result:
+                metadata_logger.debug("Kitsu→Movix: anime not found")
+                return []
+
+            title_id = movix_result.get("id")
+
+            if not title_id:
+                metadata_logger.error("Kitsu→Movix: no title ID")
+                return []
+
+            metadata_logger.debug(f"Kitsu→Movix: mapping episode {absolute_episode}")
+
+            tmdb_api_token = config.get("tmdb_api_token") if config else None
+            imdb_id = movix_result.get("imdb_id")
+
+            movix_mapping = await movix_scraper.map_kitsu_absolute_to_movix_season(
+                title_id, absolute_episode, tmdb_api_token, imdb_id
+            )
+
+            if not movix_mapping:
+                metadata_logger.error("Kitsu→Movix: mapping failed")
+                return []
+
+            movix_season, movix_episode = movix_mapping
+
+            metadata_logger.debug(f"Kitsu→Movix: S{movix_season}E{movix_episode}")
+
+            return await self._search_source_with_cache(
+                "movix", "anime",
+                lambda: movix_anime_scraper.search(title, year, movix_kitsu_metadata, movix_season, movix_episode, config),
+                title, year, movix_season, movix_episode,
+                movix_kitsu_metadata, use_episode_key=True, filter_episodes=False
+            )
+
+        except Exception as e:
+            metadata_logger.error(f"Kitsu→Movix error: {type(e).__name__}: {e}")
+            return []
+
+    def _season_episode_to_absolute(self, season: int, episode: int, seasons_data: List[Dict]) -> Optional[int]:
+        if not seasons_data:
+            return None
+
+        absolute = 0
+        for s in seasons_data:
+            s_num = s.get("number", 0)
+            ep_count = s.get("episode_count", 0)
+
+            if s_num < season:
+                absolute += ep_count
+            elif s_num == season:
+                return absolute + episode
+
+        return None
+
+    def _filter_episode_results(self, results: List[Dict], season: Optional[str],
+                                episode: Optional[str], content_type: str,
+                                metadata: Optional[Dict] = None) -> List[Dict]:
+        if not results or not season or not episode:
+            return results
+
+        seasons_data = None
+        if metadata:
+            seasons_data = metadata.get("seasons")
+
+        if seasons_data:
+            try:
+                target_absolute = self._season_episode_to_absolute(
+                    int(season), int(episode), seasons_data
+                )
+
+                if target_absolute:
+                    filtered = []
+                    for r in results:
+                        r_season = r.get("season")
+                        r_episode = r.get("episode")
+
+                        if r_season and r_episode:
+                            r_absolute = self._season_episode_to_absolute(
+                                int(r_season), int(r_episode), seasons_data
+                            )
+                            if r_absolute == target_absolute:
+                                filtered.append(r)
+
+                    stream_logger.debug(f"Absolute filtered S{season}E{episode} (abs:{target_absolute}): {len(filtered)} results")
+                    return filtered
+
+            except (ValueError, TypeError):
+                pass
+
+        # Comparaison numérique tolérante au zero-padding : les sites DDL
+        # (Wawacity/Free-Telecharger) renvoient parfois "Saison 02"/"s01" →
+        # season="02" alors que la requête Stremio est "2". Une égalité de
+        # chaînes brute écarterait ces résultats en silence. On compare donc
+        # numériquement quand c'est possible, avec repli sur l'égalité de
+        # chaînes si une valeur n'est pas un entier propre.
+        def _se_equal(a, b) -> bool:
+            if a is None or b is None:
+                return a == b
+            try:
+                return int(a) == int(b)
+            except (ValueError, TypeError):
+                return str(a) == str(b)
+
+        filtered = [
+            r for r in results
+            if _se_equal(r.get("season"), season) and _se_equal(r.get("episode"), episode)
+        ]
+
+        stream_logger.debug(f"Filtered S{season}E{episode}: {len(filtered)} results")
+        return filtered
+
+    def _get_early_stop_config(self, config: Dict) -> Dict:
+        return {
+            "enabled": config.get("early_stop", False),
+            "min_streams": max(0, config.get("early_stop_min_streams", 0)),
+            "min_hosts": max(0, config.get("early_stop_min_hosts", 0)),
+            "sources": config.get("early_stop_sources", []),
+            "hosts": config.get("early_stop_hosts", []),
+            "resolutions": config.get("early_stop_resolutions", []),
+            "include_nzb": config.get("early_stop_include_nzb", False)
+        }
+
+    def _clamp_int(self, value, default: int, low: int, high: int) -> int:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = default
+        return min(max(low, value), high)
+
+    def _get_resilient_config(self, config: Dict) -> Dict:
+        return {
+            "enabled": config.get("resilient_enabled", False),
+            "mode": config.get("resilient_mode", "sequential"),
+            "max_fallbacks": self._clamp_int(config.get("resilient_max_fallbacks", 3), 3, 0, settings.RESILIENT_MAX_FALLBACKS),
+            "attempt_timeout": self._clamp_int(config.get("resilient_max_delay", 0), 0, 0, settings.RESILIENT_ATTEMPT_TIMEOUT_MAX),
+            "same_resolution": config.get("resilient_same_resolution", True),
+            "same_language": config.get("resilient_same_language", True),
+            "same_quality": config.get("resilient_same_quality", False),
+            "same_host": config.get("resilient_same_host", False),
+            "same_source": config.get("resilient_same_source", False),
+            "same_debrid": config.get("resilient_same_debrid_only", True),
+            "allow_uncached": config.get("resilient_allow_uncached", False)
+        }
+
+    def _parse_language_set(self, language: str) -> set:
+        if not language or language == "Unknown":
+            return set()
+        if language.startswith(MULTI_LANGUAGE_PREFIX.title()) and language.endswith(")"):
+            inner = language[MULTI_PREFIX_LENGTH:-1]
+            return {lang.strip() for lang in inner.split(",") if lang.strip()}
+        return {language}
+
+    def _is_archive_result(self, result: Dict) -> bool:
+        archive_extensions = (".rar", ".zip", ".7z", ".tar", ".gz")
+        for key in ("display_name", "debrid_filename"):
+            name = (result.get(key) or "").strip().lower()
+            if name.endswith(archive_extensions):
+                return True
+        return False
+
+    def _matches_excluded_keyword(self, result: Dict, excluded_keywords: List[str]) -> bool:
+        if not excluded_keywords:
+            return False
+        text = " ".join(
+            str(result.get(key, "")) for key in ("display_name", "debrid_filename", "quality", "language", "source", "hoster", "size")
+        ).lower()
+        return any(keyword.lower() in text for keyword in excluded_keywords)
+
+    def _build_fallback_candidates(self, primary: Dict, pool: List[Dict], rp: Dict) -> List[Dict]:
+        if rp["max_fallbacks"] <= 0:
+            return []
+
+        orig_resolution = extract_resolution(primary.get("quality", "Unknown"))
+        orig_release = quality_sort_key(primary)[1]
+        orig_languages = self._parse_language_set(primary.get("language", "Unknown"))
+        orig_host = primary.get("hoster", "").lower()
+        orig_source = primary.get("source", "")
+        orig_debrid = primary.get("debrid_service", "")
+
+        candidates = []
+        seen = {primary.get("link")}
+
+        for result in pool:
+            link = result.get("link")
+            if not link or link in seen:
+                continue
+            if not rp["allow_uncached"] and result.get("cache_status", "uncached") != "cached":
+                continue
+            if rp["same_debrid"] and result.get("debrid_service", "") != orig_debrid:
+                continue
+            if rp["same_source"] and result.get("source", "") != orig_source:
+                continue
+            if rp["same_host"] and result.get("hoster", "").lower() != orig_host:
+                continue
+            if rp["same_resolution"] and extract_resolution(result.get("quality", "Unknown")) != orig_resolution:
+                continue
+            if rp["same_quality"] and quality_sort_key(result)[1] != orig_release:
+                continue
+            if rp["same_language"] and orig_languages and not (orig_languages & self._parse_language_set(result.get("language", "Unknown"))):
+                continue
+
+            seen.add(link)
+            candidate = {"l": link, "s": result.get("debrid_service", "alldebrid"), "h": result.get("hoster", "")}
+            if candidate["s"] == "nzbdav":
+                nzb_name = result.get("debrid_filename") or result.get("display_name")
+                if nzb_name and nzb_name != "Unknown":
+                    candidate["t"] = nzb_name
+            candidates.append(candidate)
+
+            if len(candidates) >= rp["max_fallbacks"]:
+                break
+
+        return candidates
+
+    def _is_source_allowed_for_content(self, source_name: str, content_name: str, config: Dict) -> bool:
+        # Porte d'entree unique de chaque source : on en profite pour court-
+        # circuiter celles que le health check sait hors ligne, au lieu de les
+        # scraper dans le vide. Sans ca, un tracker qui repond 502 ralentit
+        # chaque recherche jusqu'a faire expirer la reponse cote agregateur,
+        # qui repart alors avec zero flux (incident du 2026-07-25).
+        # is_source_online() est fail-open : source inconnue du health check ou
+        # jamais testee => autorisee, on ne se coupe jamais tout seul.
+        if not is_source_online(SOURCE_DISPLAY_NAMES.get(source_name, source_name)):
+            stream_logger.debug(f"[Health] {source_name} ignoree (hors ligne)")
+            return False
+
+        if not config or not config.get("source_content_types", False):
+            return True
+        sct_config = config.get("source_content_types_config", {})
+        if not sct_config or source_name not in sct_config:
+            return True
+        allowed = content_name in sct_config[source_name]
+        if not allowed:
+            stream_logger.debug(f"[Source-Content] {source_name} skipped for '{content_name}' (allowed: {sct_config[source_name]})")
+        return allowed
+
+    def _check_early_stop_conditions(self, results: List[Dict], early_stop_config: Dict, source_name: str) -> bool:
+        stream_logger.debug(f"[Early-Stop] Check: source={source_name}, config={early_stop_config}")
+
+        if not early_stop_config["enabled"]:
+            stream_logger.debug("[Early-Stop] Disabled")
+            return False
+
+        has_any_condition = (
+            early_stop_config["min_streams"] > 0
+            or early_stop_config["min_hosts"] > 0
+            or early_stop_config["resolutions"]
+            or early_stop_config["sources"]
+        )
+        if not has_any_condition:
+            stream_logger.debug("[Early-Stop] No conditions configured")
+            return False
+
+        if early_stop_config["sources"] and source_name not in early_stop_config["sources"]:
+            stream_logger.debug(f"[Early-Stop] Source '{source_name}' not in allowed sources {early_stop_config['sources']}")
+            return False
+
+        if early_stop_config["include_nzb"]:
+            filtered_results = results
+        else:
+            filtered_results = [r for r in results if "/nzb/" not in r.get("link", "")]
+
+        unique_links = set(r.get("link", "") for r in filtered_results if r.get("link"))
+        unique_count = len(unique_links)
+        stream_logger.debug(f"[Early-Stop] {unique_count} unique streams (min required: {early_stop_config['min_streams']})")
+
+        if early_stop_config["min_streams"] > 0 and unique_count < early_stop_config["min_streams"]:
+            stream_logger.debug(f"[Early-Stop] FAILED - not enough streams ({unique_count} < {early_stop_config['min_streams']})")
+            return False
+
+        if early_stop_config["min_hosts"] > 0:
+            hosts_in_results = set()
+            for r in filtered_results:
+                host = r.get("hoster", "").lower()
+                if host:
+                    hosts_in_results.add(host)
+
+            stream_logger.debug(f"[Early-Stop] {len(hosts_in_results)} unique hosts found: {hosts_in_results} (min required: {early_stop_config['min_hosts']})")
+
+            if early_stop_config["hosts"]:
+                matching_hosts = hosts_in_results.intersection(set(h.lower() for h in early_stop_config["hosts"]))
+                if len(matching_hosts) < early_stop_config["min_hosts"]:
+                    stream_logger.debug(f"[Early-Stop] FAILED - not enough matching hosts ({len(matching_hosts)} < {early_stop_config['min_hosts']})")
+                    return False
+            else:
+                if len(hosts_in_results) < early_stop_config["min_hosts"]:
+                    stream_logger.debug(f"[Early-Stop] FAILED - not enough hosts ({len(hosts_in_results)} < {early_stop_config['min_hosts']})")
+                    return False
+
+        if early_stop_config["resolutions"]:
+            required_resolutions = set(r.lower() for r in early_stop_config["resolutions"])
+            has_required_resolution = False
+            qualities_found = [r.get("quality", "") for r in filtered_results]
+            stream_logger.debug(f"[Early-Stop] Checking resolutions, required={required_resolutions}, found qualities={qualities_found}")
+
+            for r in filtered_results:
+                quality = r.get("quality", "")
+                if quality:
+                    quality_upper = quality.upper()
+                    if "2160" in quality_upper or "4K" in quality_upper:
+                        if "2160p" in required_resolutions:
+                            has_required_resolution = True
+                            break
+                    elif "1080" in quality_upper:
+                        if "1080p" in required_resolutions:
+                            has_required_resolution = True
+                            break
+                    elif "720" in quality_upper:
+                        if "720p" in required_resolutions:
+                            has_required_resolution = True
+                            break
+                    elif "480" in quality_upper:
+                        if "480p" in required_resolutions:
+                            has_required_resolution = True
+                            break
+            if not has_required_resolution:
+                stream_logger.debug("[Early-Stop] FAILED - no matching resolution found")
+                return False
+
+        stream_logger.debug("[Early-Stop] ALL CONDITIONS MET - triggering")
+        return True
+
+    async def _search_content_common(self, content_type: str, content_name: str,
+                                     wawacity_scraper, darki_scraper, free_telecharger_scraper,
+                                     wasource_scraper, movix_scraper, webshare_scraper,
+                                     zone_telechargement_scraper,
+                                     title: str, year: Optional[str],
+                                     metadata: Optional[Dict] = None,
+                                     season: Optional[str] = None, episode: Optional[str] = None,
+                                     config: Dict = None, use_episode_cache: bool = False) -> List[Dict]:
+        supported_sources = self._get_supported_sources(config) if config else settings.ALLDEBRID_SUPPORTED_SOURCES
+        early_stop_config = self._get_early_stop_config(config) if config else {"enabled": False, "min_streams": 3, "min_hosts": 2, "sources": [], "hosts": []}
+
+        tasks_with_sources = []
+
+        if "wasource" in supported_sources and self._is_source_allowed_for_content("wasource", content_name, config):
+            if use_episode_cache:
+                coro = wasource_scraper.search(title, year, metadata, season, episode, config)
+            else:
+                coro = wasource_scraper.search(title, year, metadata, config)
+            tasks_with_sources.append(("wasource", coro))
+
+        if "wawacity" in supported_sources and self._is_source_allowed_for_content("wawacity", content_name, config):
+            coro = self._search_source_with_cache(
+                "wawacity", content_type, lambda: wawacity_scraper.search(title, year, metadata),
+                title, year, season if use_episode_cache else None, episode if use_episode_cache else None,
+                metadata, use_episode_key=False, filter_episodes=True)
+            tasks_with_sources.append(("wawacity", coro))
+
+        if "free-telecharger" in supported_sources and self._is_source_allowed_for_content("free-telecharger", content_name, config):
+            coro = self._search_source_with_cache(
+                "free_telecharger", content_type, lambda: free_telecharger_scraper.search(title, year, metadata),
+                title, year, season if use_episode_cache else None, episode if use_episode_cache else None,
+                metadata, use_episode_key=False, filter_episodes=True)
+            tasks_with_sources.append(("free-telecharger", coro))
+
+        if "darki-api" in supported_sources and self._is_source_allowed_for_content("darki-api", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "darki_api", content_type, lambda: darki_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "darki_api", content_type, lambda: darki_scraper.search(title, year, metadata, config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("darki-api", coro))
+
+        if "movix" in supported_sources and self._is_source_allowed_for_content("movix", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "movix", content_type, lambda: movix_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "movix", content_type, lambda: movix_scraper.search(title, year, metadata, config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("movix", coro))
+
+        if "webshare" in supported_sources and self._is_source_allowed_for_content("webshare", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "webshare", content_type, lambda: webshare_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "webshare", content_type, lambda: webshare_scraper.search(title, year, metadata, config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("webshare", coro))
+
+        if "zone-telechargement" in supported_sources and self._is_source_allowed_for_content("zone-telechargement", content_name, config):
+            if use_episode_cache:
+                do_search = lambda: zone_telechargement_scraper.search(
+                    title, year, metadata, season, episode
+                )
+            else:
+                do_search = lambda: zone_telechargement_scraper.search(title, year, metadata)
+            coro = self._search_source_with_cache(
+                "zone_telechargement", content_type, do_search,
+                title, year, season if use_episode_cache else None, episode if use_episode_cache else None,
+                metadata, use_episode_key=use_episode_cache, filter_episodes=False)
+            tasks_with_sources.append(("zone-telechargement", coro))
+        if "yggreborn" in supported_sources and self._is_source_allowed_for_content("yggreborn", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "yggreborn", content_type, lambda: yggreborn_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "yggreborn", content_type, lambda: yggreborn_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("yggreborn", coro))
+
+        if "tr4ker" in supported_sources and self._is_source_allowed_for_content("tr4ker", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "tr4ker", content_type, lambda: tr4ker_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "tr4ker", content_type, lambda: tr4ker_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("tr4ker", coro))
+
+        if "torr9" in supported_sources and self._is_source_allowed_for_content("torr9", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "torr9", content_type, lambda: torr9_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "torr9", content_type, lambda: torr9_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("torr9", coro))
+
+        if "c411" in supported_sources and self._is_source_allowed_for_content("c411", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "c411", content_type, lambda: c411_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "c411", content_type, lambda: c411_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("c411", coro))
+
+        if "v3x" in supported_sources and self._is_source_allowed_for_content("v3x", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "v3x", content_type, lambda: v3x_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "v3x", content_type, lambda: v3x_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("v3x", coro))
+
+        if "gemini" in supported_sources and self._is_source_allowed_for_content("gemini", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "gemini", content_type, lambda: gemini_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "gemini", content_type, lambda: gemini_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("gemini", coro))
+
+        if "generation-free" in supported_sources and self._is_source_allowed_for_content("generation-free", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "generation_free", content_type, lambda: generationfree_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "generation_free", content_type, lambda: generationfree_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("generation-free", coro))
+
+        if "zilean" in supported_sources and self._is_source_allowed_for_content("zilean", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "zilean", content_type, lambda: zilean_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "zilean", content_type, lambda: zilean_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("zilean", coro))
+
+        # Nyaa Live Action : les torrents japonais non-anime (dramas, variete,
+        # tele-realite type Old Enough!/Comme les grands) sont indexes sur
+        # Nyaa.si sous la categorie Live Action (4_0), distincte de la
+        # categorie Anime (1_0) deja interrogee cote Kitsu. Gate sur
+        # original_language == "ja" (TMDB) pour ne jamais interroger Nyaa sur
+        # du contenu non-japonais — cout sinon negligeable, l'appel tourne en
+        # parallele des autres sources comme les blocs ci-dessus.
+        #
+        # Nyaa n'indexe quasiment jamais un titre francais : "Comme les
+        # grands" -> 0 resultat, "Old Enough" (titre anglais/romaji, trouve
+        # uniquement via l'endpoint TMDB alternative_titles) -> 3, constate en
+        # reel le 2026-08-01. La recherche essaie donc le titre principal ET
+        # `nyaa_candidate_titles` (deja plafonne a 5 cote tmdb.py), en
+        # parallele, dedupliques par infohash.
+        #
+        # ⚠️ Piege deja fait une fois : NE JAMAIS utiliser metadata["titles"]/
+        # ["original_titles"] ici — ces listes alimentent aussi le retitrage
+        # generique de get_streams pour TOUTES les sources (Wawacity, Torznab,
+        # etc.), et `alternative_titles` peut contenir des dizaines d'entrees
+        # par pays. Melange constate en reel : rate-limit Nyaa/C411 (429 en
+        # rafale) + verrous Wawacity satures, recherche entiere effondree.
+        # `nyaa_candidate_titles` est une liste dediee et courte, safe.
+        if (
+            "nyaa" in supported_sources
+            and content_name in ("movie", "series")
+            and metadata
+            and metadata.get("original_language") == "ja"
+            and self._is_source_allowed_for_content("nyaa", content_name, config)
+        ):
+            candidate_titles = [title]
+            for extra_title in (metadata.get("nyaa_candidate_titles") or [])[:5]:
+                if extra_title and extra_title not in candidate_titles:
+                    candidate_titles.append(extra_title)
+
+            async def _search_nyaa_multi_title():
+                results_lists = await asyncio.gather(
+                    *(nyaa_scraper.search(t, year, metadata, season, episode, config, category="4_0")
+                      for t in candidate_titles),
+                    return_exceptions=True
+                )
+                seen_hashes = set()
+                merged = []
+                for r in results_lists:
+                    if not isinstance(r, list):
+                        continue
+                    for item in r:
+                        infohash = item.get("infohash")
+                        if infohash and infohash in seen_hashes:
+                            continue
+                        if infohash:
+                            seen_hashes.add(infohash)
+                        merged.append(item)
+                return merged
+
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "nyaa", content_type, _search_nyaa_multi_title,
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "nyaa", content_type, _search_nyaa_multi_title,
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("nyaa", coro))
+
+        # Source d'appoint optionnelle (absente du depot public) : lancee en
+        # parallele des autres, sur chaque recherche. Elle n'apporte QUE des
+        # torrents deja verifies en cache, donc lisibles immediatement — c'est
+        # exactement ce qui manque quand une recherche remonte beaucoup de flux
+        # dont aucun ne demarre. La conditionner au NOMBRE de resultats etait
+        # une erreur : le nombre ne dit rien de leur jouabilite.
+        # Sa protection contre le quota n'est pas ici mais dans le module lui-
+        # meme : pause de 24h persistee sur disque apres un refus (429).
+        if "lumio" in supported_sources and self._is_source_allowed_for_content("lumio", content_name, config):
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "lumio", content_type,
+                    lambda: lumio_scraper.search(title, year, metadata, season, episode, config),
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "lumio", content_type,
+                    lambda: lumio_scraper.search(title, year, metadata, config=config),
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("lumio", coro))
+
+        if not tasks_with_sources:
+            return []
+
+        if not early_stop_config["enabled"]:
+            tasks = [t[1] for t in tasks_with_sources]
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+            all_results = []
+            for result in results_list:
+                if isinstance(result, list):
+                    all_results.extend(result)
+                elif isinstance(result, Exception):
+                    stream_logger.error(f"{content_name.title()} search failed: {type(result).__name__}: {result}")
+
+            return all_results
+
+        all_results = []
+        pending_tasks = {}
+        early_stop_triggered = False
+
+        for source_name, coro in tasks_with_sources:
+            task = asyncio.create_task(coro)
+            pending_tasks[task] = source_name
+
+        try:
+            while pending_tasks:
+                done, _ = await asyncio.wait(
+                    pending_tasks.keys(),
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done:
+                    source_name = pending_tasks.pop(task)
+
+                    try:
+                        result = task.result()
+                        if isinstance(result, list):
+                            all_results.extend(result)
+                            stream_logger.debug(f"[Early-Stop] {source_name} returned {len(result)} results")
+
+                            if not early_stop_triggered and self._check_early_stop_conditions(all_results, early_stop_config, source_name):
+                                early_stop_triggered = True
+                                stream_logger.info(f"[Early-Stop] Triggered by {source_name} with {len(all_results)} results")
+
+                    except Exception as e:
+                        stream_logger.error(f"{content_name.title()} search failed ({source_name}): {type(e).__name__}: {e}")
+
+                if early_stop_triggered and pending_tasks:
+                    stream_logger.debug(f"[Early-Stop] Returning early, {len(pending_tasks)} sources still running in background")
+
+                    async def background_collector(remaining_tasks: Dict, current_results: List[Dict]):
+                        for remaining_task in remaining_tasks:
+                            try:
+                                result = await remaining_task
+                                if isinstance(result, list):
+                                    current_results.extend(result)
+                                    stream_logger.debug(f"[Early-Stop] Background: collected {len(result)} additional results")
+                            except Exception as e:
+                                stream_logger.error(f"[Early-Stop] Background task failed: {type(e).__name__}: {e}")
+
+                    lancer_tache(background_collector(list(pending_tasks.keys()), all_results))
+                    break
+
+        except Exception as e:
+            stream_logger.error(f"[Early-Stop] Error: {type(e).__name__}: {e}")
+            for task in pending_tasks:
+                task.cancel()
+
+        return all_results
+
+    async def _search_movie(self, title: str, year: Optional[str], metadata: Optional[Dict] = None, config: Dict = None) -> List[Dict]:
+        return await self._search_content_common("movies", "movie", wawacity_movie_scraper, darki_api_movie_scraper,
+                                                 free_telecharger_movie_scraper, wasource_movie_scraper, movix_movie_scraper, webshare_movie_scraper,
+                                                 zone_telechargement_movie_scraper,
+                                                 title, year, metadata, None, None, config, use_episode_cache=False)
+
+    async def _search_anime(self, title: str, year: Optional[str],
+                            season: Optional[str], episode: Optional[str], metadata: Optional[Dict] = None, config: Dict = None) -> List[Dict]:
+        return await self._search_content_common("anime", "anime", wawacity_anime_scraper, darki_api_anime_scraper,
+                                                 free_telecharger_anime_scraper, wasource_anime_scraper, movix_anime_scraper, webshare_anime_scraper,
+                                                 zone_telechargement_anime_scraper,
+                                                 title, year, metadata, season, episode, config, use_episode_cache=True)
+
+    async def _search_series(self, title: str, year: Optional[str],
+                             season: Optional[str], episode: Optional[str], metadata: Optional[Dict] = None, config: Dict = None) -> List[Dict]:
+        return await self._search_content_common("series", "series", wawacity_series_scraper, darki_api_series_scraper,
+                                                 free_telecharger_series_scraper, wasource_series_scraper, movix_series_scraper, webshare_series_scraper,
+                                                 zone_telechargement_series_scraper,
+                                                 title, year, metadata, season, episode, config, use_episode_cache=True)
+
+    async def resolve_link(self, link: str, config: Dict, season: Optional[str] = None, episode: Optional[str] = None, service: Optional[str] = None, content_type: Optional[str] = None, title: Optional[str] = None, source: Optional[str] = None, hoster: Optional[str] = None, mark_dead: bool = True) -> Optional[str]:
+        link = canonicalize_url(link)
+        if service:
+            debrid_service = self._get_debrid_service(service)
+            debrid_api_key = get_debrid_api_key(config, service)
+        else:
+            debrid_services = get_debrid_services(config)
+            if debrid_services:
+                first_service = debrid_services[0]
+                service = first_service.get("service", "alldebrid")
+                debrid_service = self._get_debrid_service(service)
+                debrid_api_key = first_service.get("api_key", "")
+            else:
+                debrid_service = alldebrid_service
+                debrid_api_key = ""
+
+        if service == "nzbdav":
+            nzbdav_url = config.get("nzbdav_url", "")
+            webdav_user = config.get("webdav_user", "")
+            webdav_password = config.get("webdav_password", "")
+            category = "Movies" if content_type == "movie" else "TV"
+            result = await debrid_service.convert_link(link, debrid_api_key, season, episode, nzbdav_url, webdav_user, webdav_password, category, title, hoster=hoster)
+        else:
+            result = await debrid_service.convert_link(link, debrid_api_key, season, episode, hoster=hoster)
+
+        if result == "LINK_DOWN" and mark_dead:
+            await mark_dead_link(link, settings.DEAD_LINK_TTL)
+
+        return result
+
+    def _build_link_response(self, direct_link: Optional[str]):
+        if direct_link and direct_link not in PLAYBACK_SENTINELS:
+            return RedirectResponse(url=direct_link, status_code=302)
+        elif direct_link == "LINK_DOWN":
+            return FileResponse("wastream/public/link_down.mp4")
+        elif direct_link == "LINK_UNCACHED":
+            return FileResponse("wastream/public/uncached.mp4")
+        elif direct_link == "RETRY_ERROR":
+            return FileResponse("wastream/public/retry_error.mp4")
+        else:
+            return FileResponse("wastream/public/fatal_error.mp4")
+
+    async def _resolve_attempt(self, attempt: Dict, config: Dict, season: Optional[str], episode: Optional[str], content_type: Optional[str], source: Optional[str], timeout: int, is_primary: bool) -> Optional[str]:
+        try:
+            coro = self.resolve_link(
+                attempt.get("l"), config, season, episode,
+                attempt.get("s"), content_type, attempt.get("t"), source, attempt.get("h"),
+                mark_dead=is_primary
+            )
+            if timeout > 0:
+                return await asyncio.wait_for(coro, timeout=timeout)
+            return await coro
+        except asyncio.TimeoutError:
+            stream_logger.debug(f"[Resilient] Attempt timed out after {timeout}s")
+            return "RETRY_ERROR"
+        except Exception as e:
+            stream_logger.error(f"[Resilient] Attempt error: {type(e).__name__}: {e}")
+            return "FATAL_ERROR"
+
+    async def _resolve_sequential(self, attempts: List[Dict], config: Dict, season: Optional[str], episode: Optional[str], content_type: Optional[str], source: Optional[str], rp: Dict) -> Optional[str]:
+        primary_result = None
+        for index, attempt in enumerate(attempts):
+            result = await self._resolve_attempt(attempt, config, season, episode, content_type, source, rp["attempt_timeout"], index == 0)
+            if result and result not in PLAYBACK_SENTINELS:
+                if index > 0:
+                    stream_logger.info(f"[Resilient] Recovered via backup #{index} ({attempt.get('h') or '?'} / {attempt.get('s') or '?'})")
+                return result
+            if index == 0:
+                primary_result = result
+                if len(attempts) > 1:
+                    stream_logger.info(f"[Resilient] Primary link down ({result}), trying {len(attempts) - 1} backup(s) sequentially")
+            else:
+                stream_logger.debug(f"[Resilient] Backup #{index} ({attempt.get('h') or '?'}) failed ({result})")
+        stream_logger.info(f"[Resilient] All backups exhausted, keeping primary result ({primary_result})")
+        return primary_result
+
+    async def _resolve_race(self, attempts: List[Dict], config: Dict, season: Optional[str], episode: Optional[str], content_type: Optional[str], source: Optional[str]) -> Optional[str]:
+        primary_result = {}
+        queue = list(enumerate(attempts))
+        concurrency = min(len(attempts), settings.RESILIENT_MAX_CONCURRENCY)
+        stream_logger.debug(f"[Resilient] Racing primary + {len(attempts) - 1} backup(s)")
+
+        async def run(index, attempt):
+            result = await self._resolve_attempt(attempt, config, season, episode, content_type, source, 0, index == 0)
+            if index == 0:
+                primary_result["value"] = result
+            return index, result
+
+        pending = set()
+        while queue and len(pending) < concurrency:
+            index, attempt = queue.pop(0)
+            pending.add(asyncio.create_task(run(index, attempt)))
+
+        winner = None
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                index, result = task.result()
+                if result and result not in PLAYBACK_SENTINELS:
+                    winner = result
+                    if index > 0:
+                        won = attempts[index]
+                        stream_logger.info(f"[Resilient] Race recovered via backup #{index} ({won.get('h') or '?'} / {won.get('s') or '?'})")
+                    break
+            if winner:
+                break
+            while queue and len(pending) < concurrency:
+                index, attempt = queue.pop(0)
+                pending.add(asyncio.create_task(run(index, attempt)))
+
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if winner:
+            return winner
+        stream_logger.info(f"[Resilient] Race: all failed, keeping primary result ({primary_result.get('value')})")
+        return primary_result.get("value", "FATAL_ERROR")
+
+    async def resolve_link_with_response(self, link: str, config: Dict, season: Optional[str] = None, episode: Optional[str] = None, service: Optional[str] = None, content_type: Optional[str] = None, title: Optional[str] = None, source: Optional[str] = None, hoster: Optional[str] = None, alternates: Optional[List[Dict]] = None):
+        rp = self._get_resilient_config(config)
+
+        if not rp["enabled"] or not alternates:
+            direct_link = await self.resolve_link(link, config, season, episode, service, content_type, title, source, hoster)
+            return self._build_link_response(direct_link)
+
+        primary = {"l": link, "s": service, "h": hoster, "t": title}
+        attempts = [primary] + list(alternates)[:rp["max_fallbacks"]]
+
+        if rp["mode"] == "parallel":
+            direct_link = await self._resolve_race(attempts, config, season, episode, content_type, source)
+        else:
+            direct_link = await self._resolve_sequential(attempts, config, season, episode, content_type, source, rp)
+
+        return self._build_link_response(direct_link)
+
+    async def _handle_kitsu_request(self, media_info: Dict, config: Dict, base_url: str, start_time: float) -> List[Dict]:
+        kitsu_id = media_info.get("kitsu_id")
+        episode = media_info.get("episode")
+
+        config = {
+            **config,
+            "enable_full_season": should_enable_full_season(config)
+        }
+
+        if not kitsu_id:
+            stream_logger.error("Empty Kitsu ID")
+            return []
+
+        kitsu_metadata = await kitsu_service.get_metadata(kitsu_id)
+        if not kitsu_metadata:
+            stream_logger.error(f"Kitsu metadata failed: {kitsu_id}")
+            return []
+
+        if kitsu_metadata.get("subtype") == "movie":
+            search_title = kitsu_metadata["title"]
+            search_year = kitsu_metadata.get("year")
+            kitsu_titles = kitsu_metadata.get("search_titles", [kitsu_metadata["title"]])
+
+            enhanced_kitsu_metadata = {
+                "titles": kitsu_titles,
+                "original_titles": kitsu_titles,
+                "all_titles": kitsu_metadata.get("all_titles", [kitsu_metadata["title"]]),
+                "year": search_year,
+                "type": "movie",
+                "content_type": "movies"
+            }
+
+            results = await self._search_movie(search_title, search_year, enhanced_kitsu_metadata, config)
+
+            if not results:
+                stream_logger.debug(f"No content: Kitsu {kitsu_metadata['title']}")
+                return []
+
+            results = deduplicate_and_sort_results(results, quality_sort_key)
+
+            results = apply_all_filters(results, config, "movie")
+
+            elapsed = time.time() - start_time
+            timeout = config.get("stream_request_timeout", settings.STREAM_REQUEST_TIMEOUT)
+            remaining_time = max(0, timeout - elapsed)
+
+            debrid_services = get_debrid_services(config)
+            enriched_results = await self._check_cache_and_enrich(
+                results, debrid_services, config, remaining_time, None, None
+            )
+
+            streams = await self._format_streams(
+                enriched_results,
+                config,
+                base_url,
+                None,
+                None,
+                kitsu_metadata.get("year"),
+                "movie"
+            )
+
+            streams = filter_archive_files(streams)
+
+        else:
+            actual_season = None
+            actual_episode = None
+            season_mapping = None
+            base_metadata = None
+            season_mapping = None
+            search_title = kitsu_metadata["title"]
+            search_year = kitsu_metadata.get("year")
+
+            if episode:
+                actual_season, actual_episode, season_mapping, base_title, base_year, base_metadata = await kitsu_service.get_season_chain_and_mapping(
+                    kitsu_id,
+                    int(episode)
+                )
+                if base_title:
+                    search_title = base_title
+                if base_year:
+                    search_year = base_year
+
+            if base_metadata:
+                kitsu_titles = base_metadata.get("search_titles", [base_metadata["title"]])
+                enhanced_kitsu_metadata = {
+                    "titles": kitsu_titles,
+                    "original_titles": kitsu_titles,
+                    "all_titles": base_metadata.get("all_titles", [base_metadata["title"]]),
+                    "year": search_year,
+                    "type": "anime",
+                    "content_type": "anime"
+                }
+            else:
+                kitsu_titles = [search_title] + kitsu_metadata.get("aliases", [])
+                enhanced_kitsu_metadata = {
+                    "titles": kitsu_titles,
+                    "original_titles": kitsu_titles,
+                    "year": search_year,
+                    "type": "anime",
+                    "content_type": "anime"
+                }
+
+            supported_sources = self._get_supported_sources(config) if config else settings.ALLDEBRID_SUPPORTED_SOURCES
+
+            tasks = []
+
+            if "wasource" in supported_sources and self._is_source_allowed_for_content("wasource", "anime", config):
+                tasks.append(wasource_anime_scraper.search(
+                    search_title, search_year, enhanced_kitsu_metadata,
+                    str(actual_season), str(actual_episode), config
+                ))
+
+            if "wawacity" in supported_sources and self._is_source_allowed_for_content("wawacity", "anime", config):
+                tasks.append(self._search_source_with_cache(
+                    "wawacity", "anime", lambda: wawacity_anime_scraper.search(search_title, search_year, enhanced_kitsu_metadata),
+                    search_title, search_year, str(actual_season), str(actual_episode),
+                    enhanced_kitsu_metadata, use_episode_key=False, filter_episodes=True
+                ))
+
+            if "free-telecharger" in supported_sources and self._is_source_allowed_for_content("free-telecharger", "anime", config):
+                tasks.append(self._search_source_with_cache(
+                    "free_telecharger", "anime", lambda: free_telecharger_anime_scraper.search(search_title, search_year, enhanced_kitsu_metadata),
+                    search_title, search_year, str(actual_season), str(actual_episode),
+                    enhanced_kitsu_metadata, use_episode_key=False, filter_episodes=True
+                ))
+
+            if "darki-api" in supported_sources and self._is_source_allowed_for_content("darki-api", "anime", config):
+                absolute_ep = season_mapping.get("absolute_episode", actual_episode) if season_mapping else actual_episode
+
+                tasks.append(self._search_darki_api_with_kitsu_direct_mapping(
+                    search_title, search_year, enhanced_kitsu_metadata,
+                    absolute_ep, config
+                ))
+
+            if "movix" in supported_sources and self._is_source_allowed_for_content("movix", "anime", config):
+                absolute_ep = season_mapping.get("absolute_episode", actual_episode) if season_mapping else actual_episode
+
+                tasks.append(self._search_movix_with_kitsu_direct_mapping(
+                    search_title, search_year, enhanced_kitsu_metadata,
+                    absolute_ep, config
+                ))
+
+            if "webshare" in supported_sources and self._is_source_allowed_for_content("webshare", "anime", config):
+                _s, _e = str(actual_season), str(actual_episode)
+                tasks.append(self._search_source_with_cache(
+                    "webshare", "anime", lambda: webshare_anime_scraper.search(search_title, search_year, enhanced_kitsu_metadata, _s, _e, config),
+                    search_title, search_year, _s, _e,
+                    enhanced_kitsu_metadata, use_episode_key=True, filter_episodes=False
+                ))
+
+            if "zone-telechargement" in supported_sources and self._is_source_allowed_for_content("zone-telechargement", "anime", config):
+                tasks.append(self._search_source_with_cache(
+                    "zone_telechargement", "anime", lambda: zone_telechargement_anime_scraper.search(
+                        search_title, search_year, enhanced_kitsu_metadata,
+                        str(actual_season), str(actual_episode)
+                    ),
+                    search_title, search_year, str(actual_season), str(actual_episode),
+                    enhanced_kitsu_metadata, use_episode_key=True, filter_episodes=False
+                ))
+
+            if "nyaa" in supported_sources and self._is_source_allowed_for_content("nyaa", "anime", config):
+                _s, _e = str(actual_season), str(actual_episode)
+                # Les releases Nyaa numerotent souvent en continu (S02E01 = « 13 »).
+                # Le numero absolu est deja calcule par le mapping Kitsu, il n'etait
+                # simplement jamais transmis : sans lui, une saison 2 ne pouvait pas
+                # etre filtree correctement.
+                _abs = str(season_mapping.get("absolute_episode")) if season_mapping and season_mapping.get("absolute_episode") else None
+                tasks.append(self._search_source_with_cache(
+                    "nyaa", "anime", lambda: nyaa_scraper.search(search_title, search_year, enhanced_kitsu_metadata, _s, _e, config, absolute_episode=_abs),
+                    search_title, search_year, _s, _e,
+                    enhanced_kitsu_metadata, use_episode_key=True, filter_episodes=False
+                ))
+
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+            results = []
+            for result in results_list:
+                if isinstance(result, list):
+                    results.extend(result)
+                elif isinstance(result, Exception):
+                    stream_logger.error(f"Kitsu search failed: {type(result).__name__}: {result}")
+
+            if not results:
+                stream_logger.debug(f"No content: Kitsu {kitsu_metadata['title']}")
+                return []
+
+            results = deduplicate_and_sort_results(results, quality_sort_key)
+
+            results = apply_all_filters(results, config, "series")
+
+            elapsed = time.time() - start_time
+            timeout = config.get("stream_request_timeout", settings.STREAM_REQUEST_TIMEOUT)
+            remaining_time = max(0, timeout - elapsed)
+
+            debrid_services = get_debrid_services(config)
+            enriched_results = await self._check_cache_and_enrich(
+                results, debrid_services, config, remaining_time,
+                str(actual_season) if actual_season else None,
+                str(actual_episode) if actual_episode else None
+            )
+
+            streams = await self._format_streams(
+                enriched_results,
+                config,
+                base_url,
+                None,
+                None,
+                search_year,
+                "series"
+            )
+
+            streams = filter_archive_files(streams)
+
+        excluded_keywords = config.get("excluded_keywords", [])
+        if excluded_keywords:
+            filtered_streams = filter_excluded_keywords(streams, excluded_keywords)
+            excluded_count = len(streams) - len(filtered_streams)
+            if excluded_count > 0:
+                stream_logger.debug(f"Excluded {excluded_count} streams")
+            return filtered_streams
+
+        return streams
+
+
+# ===========================
+# Singleton Instance
+# ===========================
+stream_service = StreamService()

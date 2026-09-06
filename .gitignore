@@ -1,0 +1,117 @@
+# ===========================
+# Environment
+# ===========================
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+# Sauvegardes de fichiers d'environnement : elles contiennent les clés en clair
+# et ne sont PAS couvertes par "*.env" (le nom se termine par .bak-<date>).
+# Sans cette règle, un `git add -A` les pousserait vers le dépôt public.
+*.env.bak*
+*.env.*.bak*
+
+
+# ===========================
+# Python
+# ===========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ===========================
+# Distribution / Packaging
+# ===========================
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ===========================
+# Virtual Environments
+# ===========================
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+
+# ===========================
+# Database
+# ===========================
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# ===========================
+# Logs
+# ===========================
+*.log
+logs/
+
+# ===========================
+# Testing
+# ===========================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ===========================
+# IDEs
+# ===========================
+.vscode/
+.idea/
+.obsidian/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ===========================
+# OS Files
+# ===========================
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.bak
+
+# ===========================
+# Project Specific
+# ===========================
+assets/
+
+# Scripts de debug jetables
+scratch/
+wastream/scratch/
+
+# Extensions locales (jamais publiées)
+# Lumio en est sorti le 2026-08-16 : le connecteur est desormais public,
+# chaque hebergeur fournissant son propre identifiant de manifest.
+wastream/scrapers/_private/
+
+# Notes de revue de code (analyse interne, pas de la doc projet)
+code-verification.md
+code-verification-2.md
+code-verification-resume.md
+code-verification-corrections.md

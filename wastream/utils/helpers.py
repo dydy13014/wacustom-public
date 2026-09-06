@@ -1,0 +1,595 @@
+import hashlib
+import hmac
+import json
+import re
+import unicodedata
+from base64 import b64encode, b64decode, urlsafe_b64encode, urlsafe_b64decode
+from typing import Optional, Dict, Any, List
+from urllib.parse import quote, quote_plus, urlparse, parse_qs, unquote
+
+from wastream.utils.urls import canonicalize_url
+
+
+# ===========================
+# Text Normalization
+# ===========================
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.lower()
+    text = "".join(c for c in unicodedata.normalize("NFD", text) if unicodedata.category(c) != "Mn")
+    text = "".join(c if c.isalnum() or c.isspace() else " " for c in text)
+    text = " ".join(text.split())
+
+    return text.strip()
+
+
+# ===========================
+# Configuration Encoding
+# ===========================
+def encode_config_to_base64(config: Dict[str, Any]) -> str:
+    return b64encode(json.dumps(config).encode()).decode()
+
+
+# Longueur de la signature tronquée, en caractères hexadécimaux. 128 bits :
+# largement hors de portée d'une falsification, et bien plus court que les 64
+# caractères d'un SHA-256 complet — le jeton finit dans une URL, sa taille est
+# déjà plafonnée par RESILIENT_TOKEN_MAX_BYTES.
+_SIGNATURE_LEN = 32
+
+
+def _signer(charge: str) -> str:
+    from wastream.config.settings import settings   # import tardif : évite un cycle
+    return hmac.new(
+        settings.SECRET_KEY.encode("utf-8"), charge.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:_SIGNATURE_LEN]
+
+
+def encode_playback_token(data: Dict[str, Any]) -> str:
+    """Jeton signé, au format `<charge base64>.<signature>`.
+
+    Sans signature, le contenu du jeton — le lien à débrider, et jusqu'à une
+    configuration complète avec sa clé debrid — était entièrement forgeable par
+    quiconque savait construire du base64.
+    """
+    charge = urlsafe_b64encode(
+        json.dumps(data, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    return f"{charge}.{_signer(charge)}"
+
+
+def decode_playback_token(token: str) -> Optional[Dict[str, Any]]:
+    """Renvoie None si la signature est absente, invalide, ou si le contenu est
+    illisible. Un jeton non signé (ancien format) est donc rejeté."""
+    try:
+        charge, _, signature = token.rpartition(".")
+        if not charge or not signature:
+            return None
+        if not hmac.compare_digest(signature, _signer(charge)):
+            return None
+
+        padding = 4 - len(charge) % 4
+        if padding != 4:
+            charge += "=" * padding
+        return json.loads(urlsafe_b64decode(charge).decode())
+    except Exception:
+        return None
+
+
+# ===========================
+# Cache Key Builder
+# ===========================
+def build_cache_key(cache_type: str, title: str, year: Optional[str] = None) -> str:
+    cache_key = f"{cache_type}:{quote_plus(title.lower())}"
+    if year:
+        cache_key += f":{year}"
+    return cache_key
+
+
+# ===========================
+# URL Formatting
+# ===========================
+def format_url(url: str, base_url: str) -> str:
+    if not url:
+        return ""
+
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+
+    if url.startswith("/"):
+        return f"{base_url}{url}"
+
+    return f"{base_url}/{url}"
+
+
+# ===========================
+# URL Parameter Encoding
+# ===========================
+def quote_url_param(param: str) -> str:
+    return quote_plus(param)
+
+
+def quote_path_segment(param: str) -> str:
+    return quote(param, safe="")
+
+
+# ===========================
+# Filename Extraction and Decoding
+# ===========================
+def extract_and_decode_filename(url: str) -> Optional[str]:
+    try:
+        parsed_url = urlparse(url)
+        query_params = parse_qs(parsed_url.query)
+        filename_encoded = query_params.get('fn', [None])[0]
+
+        if filename_encoded:
+            filename_unquoted = unquote(filename_encoded)
+            decoded_filename = b64decode(filename_unquoted).decode('utf-8')
+            return decoded_filename
+    except Exception:
+        pass
+    return None
+
+
+# ===========================
+# Size Normalization
+# ===========================
+def normalize_size(raw_size: str) -> str:
+    if not raw_size:
+        return "Unknown"
+
+    normalized = str(raw_size).strip()
+
+    if normalized.upper() in ["N/A", "NULL", "UNKNOWN", "INCONNU", ""]:
+        return "Unknown"
+
+    normalized_upper = normalized.upper()
+    normalized_upper = normalized_upper.replace(",", ".")
+    normalized_upper = normalized_upper.replace(" GO", " GB")
+    normalized_upper = normalized_upper.replace(" MO", " MB")
+    normalized_upper = normalized_upper.replace(" KO", " KB")
+
+    return normalized_upper
+
+
+# ===========================
+# Size Parsing to GB
+# ===========================
+def parse_size_to_gb(size_str: str) -> Optional[float]:
+    if not size_str or size_str == "Unknown":
+        return None
+
+    size_upper = size_str.upper().strip()
+
+    match = re.match(r"([\d.]+)\s*(GB|MB|KB)", size_upper)
+    if not match:
+        return None
+
+    try:
+        value = float(match.group(1))
+        unit = match.group(2)
+
+        if unit == "GB":
+            return value
+        elif unit == "MB":
+            return value / 1024.0
+        elif unit == "KB":
+            return value / (1024.0 * 1024.0)
+        else:
+            return None
+
+    except (ValueError, AttributeError):
+        return None
+
+
+# ===========================
+# Size Parsing
+# ===========================
+def parse_size_to_bytes(size_str: str) -> int:
+    if not size_str or size_str == "Unknown":
+        return 0
+    try:
+        parts = size_str.strip().split()
+        if len(parts) != 2:
+            return 0
+        value = float(parts[0])
+        unit = parts[1].upper()
+        if unit == "GB":
+            return int(value * 1024 * 1024 * 1024)
+        elif unit == "MB":
+            return int(value * 1024 * 1024)
+        elif unit == "KB":
+            return int(value * 1024)
+        return 0
+    except (ValueError, IndexError):
+        return 0
+
+
+# ===========================
+# Results Deduplication and Sorting
+# ===========================
+def deduplicate_and_sort_results(results: list, quality_sort_key_func) -> list:
+    seen_links = set()
+    seen_infohashes = set()
+    deduplicated = []
+
+    for result in results:
+        link_key = canonicalize_url(result.get("link", ""))
+        infohash = result.get("infohash", "")
+
+        # For torrents: deduplicate by infohash so the same release from
+        # multiple private trackers is only checked once against the debrid cache.
+        if infohash:
+            norm_hash = infohash.lower()
+            if norm_hash in seen_infohashes:
+                continue
+            seen_infohashes.add(norm_hash)
+
+        if link_key:
+            result["link"] = link_key
+        if link_key and link_key not in seen_links:
+            seen_links.add(link_key)
+            deduplicated.append(result)
+
+    deduplicated.sort(key=quality_sort_key_func)
+    return deduplicated
+
+
+# ===========================
+# Display Name Builder
+# ===========================
+def _clean_display_name(text: str) -> str:
+    cleaned = re.sub(r'[^\w]+', '.', text)
+    cleaned = cleaned.replace('_', '.')
+    cleaned = re.sub(r'\.{2,}', '.', cleaned)
+    return cleaned.strip('.')
+
+
+def build_display_name(title: str, year: Optional[str] = None, language: str = "Unknown",
+                       quality: str = "Unknown", season: Optional[str] = None,
+                       episode: Optional[str] = None, raw_language: Optional[str] = None) -> str:
+    display_name = _clean_display_name(title)
+
+    if year and str(year) not in title:
+        display_name += f".{year}"
+
+    if season:
+        if episode:
+            season_padded = str(season).zfill(2)
+            episode_padded = str(episode).zfill(2)
+            display_name += f".S{season_padded}E{episode_padded}"
+        else:
+            season_padded = str(season).zfill(2)
+            display_name += f".S{season_padded}"
+
+    lang_for_display = raw_language if raw_language and raw_language != "Unknown" else language
+    if lang_for_display and lang_for_display != "Unknown":
+        if lang_for_display.startswith("Multi (") and lang_for_display.endswith(")"):
+            langs_str = lang_for_display[7:-1]
+            langs = [lang.strip() for lang in langs_str.split(",")]
+            display_name += ".MULTi." + ".".join(langs)
+        else:
+            display_name += f".{_clean_display_name(lang_for_display)}"
+
+    if quality and quality != "Unknown":
+        display_name += f".{_clean_display_name(quality)}"
+
+    return display_name
+
+
+# ===========================
+# Debrid API Key Retrieval
+# ===========================
+def get_debrid_api_key(config: Dict[str, Any], service_name: str) -> str:
+    debrid_services = config.get("debrid_services", [])
+    for entry in debrid_services:
+        if entry.get("service") == service_name:
+            return entry.get("api_key", "")
+    return ""
+
+
+def get_tracker_api_key(config: Optional[Dict[str, Any]], tracker_name: str) -> str:
+    """Cle du tracker fournie par l'UTILISATEUR (mode instance publique).
+
+    Renvoie "" si l'utilisateur n'a pas renseigne ce tracker — l'appelant doit
+    alors ignorer la source pour cet utilisateur. Il n'y a volontairement AUCUN
+    repli sur une cle de l'hebergeur : c'est tout l'objet de cette version.
+    Preter la cle de l'hebergeur reviendrait a faire porter par un seul compte
+    le trafic de tous les utilisateurs — exactement ce qui fait bannir."""
+    if not config:
+        return ""
+    for entry in config.get("trackers", []) or []:
+        if entry.get("tracker") == tracker_name:
+            return entry.get("api_key", "")
+    return ""
+
+
+_LUMIO_URL_RE = re.compile(r"mylumio\.tv/([A-Za-z0-9_-]+)")
+
+
+def get_lumio_manifest_id(config: Optional[Dict[str, Any]]) -> str:
+    """Identifiant de manifest Lumio fourni par l'UTILISATEUR (mode instance
+    publique) — meme garantie que get_tracker_api_key : aucun repli sur un
+    identifiant de l'hebergeur. Accepte soit l'identifiant brut, soit l'URL
+    complete copiee depuis mylumio.tv (on en extrait juste le segment utile)."""
+    if not config:
+        return ""
+    raw = (config.get("lumio_manifest_id") or "").strip()
+    if not raw:
+        return ""
+    match = _LUMIO_URL_RE.search(raw)
+    return match.group(1) if match else raw
+
+
+# ===========================
+# Debrid Services Retrieval
+# ===========================
+def get_debrid_services(config: Dict[str, Any]) -> list:
+    return config.get("debrid_services", [])
+
+
+def should_enable_full_season(config: Dict[str, Any]) -> bool:
+    debrid_services = config.get("debrid_services", [])
+    for service_entry in debrid_services:
+        service = service_entry.get("service", "")
+        if service == "torbox":
+            if service_entry.get("enable_nzb", False) and service_entry.get("enable_full_season", False):
+                return True
+        elif service == "nzbdav":
+            if service_entry.get("enable_full_season", False):
+                return True
+    return False
+
+
+# ===========================
+# Tracker URL Normalization
+# ===========================
+def normalize_tracker_url(name: str, url: str) -> str:
+    if not url:
+        return url
+    url = url.strip().rstrip("/")
+    if name == "YggReborn":
+        if not url.endswith("/api"):
+            url = f"{url}/api"
+    elif name == "Tr4ker":
+        if not url.endswith("/api"):
+            url = f"{url}/api"
+    elif name == "Torr9":
+        if "api/v1/torznab" not in url:
+            if url.endswith("/api"):
+                url = f"{url}/v1/torznab"
+            else:
+                url = f"{url}/api/v1/torznab"
+    elif name == "V3X":
+        # L'API vit sur un sous-domaine dedie : on accepte aussi bien le site
+        # (https://v3x.club) que l'URL Torznab complete, pour ne pas imposer
+        # de connaitre ce detail.
+        if "api.v3x.club" not in url:
+            url = "https://api.v3x.club/torznab"
+        if not url.endswith("/api"):
+            url = f"{url}/api"
+    elif name == "C411":
+        if "api/torznab" not in url:
+            if url.endswith("/api"):
+                url = f"{url}/torznab"
+            else:
+                url = f"{url}/api/torznab"
+    return url
+
+
+# ===========================
+# Episode Matching (partagé torznab / debrid)
+# ===========================
+# Tous les formats courants de noms de release :
+#   S02E04, S2E4, S02.E04, s02 e04        → _EP_SXEX_RE
+#   S02E01-E04, S02E01-04 (plages)        → _EP_RANGE_RE
+#   2x04, 02x04                            → _EP_ALT_RE
+#   S02 seul, Saison 2, Season 2 (packs)   → _EP_SEASON_RE
+_EP_SXEX_RE = re.compile(r'[Ss](\d{1,2})((?:[.\s_-]?[Ee]\d{1,3})+)')
+_EP_NUM_RE = re.compile(r'[Ee](\d{1,3})')
+_EP_RANGE_RE = re.compile(r'[Ss](\d{1,2})[.\s_-]?[Ee](\d{1,3})\s?[-–]\s?[Ee]?(\d{1,3})')
+_EP_ALT_RE = re.compile(r'(?<!\d)(\d{1,2})x(\d{1,3})(?!\d)')
+_EP_SEASON_RE = re.compile(
+    r'[Ss](\d{1,2})(?![.\s_-]?[Ee]\d)|saison[\s._-]?(\d{1,2})|season[\s._-]?(\d{1,2})',
+    re.IGNORECASE
+)
+# Numéro d'épisode « nu » des releases d'animé : « Titre - 05 », « EP05 », « #12 ».
+# Ce format domine sur Nyaa et n'était couvert par aucun motif ci-dessus, si bien
+# que episode_matches() répondait « rien détecté » et que l'appelant conservait
+# TOUTES les releases — d'où des épisodes de la mauvaise saison dans les résultats.
+#
+# Deux garde-fous, indispensables pour ne pas capturer les chiffres du titre
+# (« 86 EIGHTY-SIX », « Mob Psycho 100 », « Gundam 00 ») :
+#   - un séparateur fort AVANT le numéro : tiret, tilde, ou préfixe EP/#
+#   - une assertion de suite APRÈS : tag, résolution, codec, extension, ou fin
+_EP_SUFFIX_ASSERT = (
+    r'(?=[\s\-_~.]*'
+    r'(?:\(|\[|1080p|720p|480p|2160p|x264|x265|h264|h265|hevc|avc'
+    r'|multi|vostfr|sub|dub|end|fin|batch|complete|\d+bit|\.mkv|\.mp4)'
+    r'|$)'
+)
+
+_ANIME_BARE_EP_RE = re.compile(
+    r'(?:'
+    r'(?:^|[\s\-_~.]+)(?:EP?\.?\s*|#)(\d{1,4})(?:v\d+)?'   # EP05, E05, #12
+    r'|'
+    # Le tiret doit être précédé d'un espace (ou du début du nom) : sans cette
+    # ancre, « HEVC-265 », « DTS-HD MA 5.1-NAN0 » ou un titre finissant par
+    # « -2022 1080p » étaient lus comme des numéros d'épisode.
+    r'(?:^|[\s_])[-~][\s_]*(\d{1,4})(?:v\d+)?'              # « - 05 », « ~ 12 »
+    r')'
+    + _EP_SUFFIX_ASSERT,
+    re.IGNORECASE
+)
+
+# Plage d'épisodes « nue » : « 01-13 », « 1017-1024 », « Episode 1 - 13 ».
+# Réservée aux noms SANS marqueur de saison (sinon « Season 3 - 7 » serait lu
+# comme la plage 3→7 au lieu de l'épisode 7 de la saison 3). Sans elle, seul le
+# dernier numéro était capturé : un batch « One Piece 1017-1024 » ne
+# correspondait qu'à l'épisode 1024.
+_ANIME_BARE_RANGE_RE = re.compile(
+    r'(?:^|[\s_])(\d{1,4})(?:\.\d)?\s*[-~]\s*(\d{1,4})(?:v\d+)?'
+    + _EP_SUFFIX_ASSERT,
+    re.IGNORECASE
+)
+
+# Release couvrant une saison entière : on ne doit alors pas interpréter un
+# numéro isolé du nom comme « uniquement cet épisode ».
+_BATCH_MARKER_RE = re.compile(
+    r'\b(?:batch|complete|complet|integrale|int[ée]grale|full[\s._-]?season)\b',
+    re.IGNORECASE
+)
+
+# Marqueur de saison explicite dans le nom : interdit alors de comparer au
+# numéro absolu (« S02 - 13 » veut dire l'épisode 13 DE la saison 2, pas le 13e
+# de la série).
+_EXPLICIT_SEASON_RE = re.compile(
+    r'\b(?:S\d{1,2}|Season\s*\d|Saison\s*\d|\d+(?:st|nd|rd|th)\s*Season)\b',
+    re.IGNORECASE
+)
+
+_SAMPLE_RE = re.compile(r'(?:^|[^a-z])sample(?:[^a-z]|$)', re.IGNORECASE)
+
+
+def is_sample_file(filename: str) -> bool:
+    """Détecte les fichiers 'sample' inclus dans certaines releases."""
+    return bool(_SAMPLE_RE.search(filename or ""))
+
+
+def _bare_episode_numbers(release_name: str) -> List[int]:
+    """Numéros d'épisode « nus » présents dans un nom de release d'animé."""
+    numeros = []
+    for m in _ANIME_BARE_EP_RE.finditer(release_name):
+        g = next((x for x in m.groups() if x is not None), None)
+        if g is not None:
+            numeros.append(int(g))
+    return numeros
+
+
+def episode_matches(release_name: str, season, episode,
+                    absolute_episode=None, strict: bool = False) -> Optional[bool]:
+    """Vérifie si un nom de release/fichier correspond à S{season}E{episode}.
+
+    Retourne :
+      True  → épisode exact ou season pack de la bonne saison
+      False → saison ou épisode différent
+      None  → aucune info d'épisode détectée (à l'appelant de décider)
+
+    Paramètres optionnels, sans effet s'ils ne sont pas fournis — le
+    comportement par défaut est donc STRICTEMENT identique à l'existant,
+    pour ne rien changer aux autres sources ni aux instances tierces :
+
+      absolute_episode → numérotation continue toutes saisons confondues.
+          Les releases d'animé numérotent souvent ainsi (S02E01 = « 13 »).
+          Comparé en plus du numéro relatif, mais seulement quand le nom ne
+          porte aucun marqueur de saison explicite.
+      strict → quand aucune information d'épisode n'est détectée, renvoyer
+          False (écarter) au lieu de None (laisser l'appelant décider).
+          Réservé aux sources dont la recherche est laxiste, comme Nyaa.
+    """
+    if not release_name or season is None or episode is None:
+        return None
+    try:
+        req_s, req_e = int(season), int(episode)
+        req_abs = int(absolute_episode) if absolute_episode is not None else None
+    except (ValueError, TypeError):
+        return None
+
+    # 1. Plages d'épisodes : S02E01-E04 → OK si l'épisode demandé est dedans
+    for m in _EP_RANGE_RE.finditer(release_name):
+        s, e_start, e_end = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if e_start > e_end:  # plage aberrante → ignorer
+            continue
+        if s == req_s and e_start <= req_e <= e_end:
+            return True
+
+    # 2. Épisodes explicites SxxExx, y compris multi-épisodes S02E03E04
+    sxex_pairs = []
+    for m in _EP_SXEX_RE.finditer(release_name):
+        s = int(m.group(1))
+        for e_m in _EP_NUM_RE.finditer(m.group(2)):
+            sxex_pairs.append((s, int(e_m.group(1))))
+    if sxex_pairs:
+        if (req_s, req_e) in sxex_pairs:
+            return True
+        return False  # des épisodes sont listés mais pas le nôtre
+
+    # 3. Format alternatif 2x04
+    alt_pairs = [(int(m.group(1)), int(m.group(2))) for m in _EP_ALT_RE.finditer(release_name)]
+    if alt_pairs:
+        if (req_s, req_e) in alt_pairs:
+            return True
+        return False
+
+    # 4. Saison seule (S02 / Saison 2 / Season 2) → season pack
+    seasons = []
+    for m in _EP_SEASON_RE.finditer(release_name):
+        g = next(g for g in m.groups() if g is not None)
+        seasons.append(int(g))
+    if seasons:
+        if req_s not in seasons:
+            return False
+        # « S3 - 07 », « Season 3 - 7 » : marqueur de saison ET numéro nu. Ce
+        # n'est pas un season pack mais l'épisode 7 de la saison 3 — sans ce
+        # test, n'importe quel épisode demandé de la saison correspondait
+        # (7,8 % des résultats Nyaa réels, dont le « Solo Leveling S2 - 13 »
+        # qui a fait remonter le problème). Un marqueur de batch explicite
+        # ramène au comportement season pack.
+        if not _BATCH_MARKER_RE.search(release_name):
+            bare = _bare_episode_numbers(release_name)
+            if bare:
+                return req_e in bare
+        return True
+
+    # 5. Numéro « nu » des releases d'animé (« Titre - 05 », « EP05 », « #12 »).
+    #    Ne s'applique qu'aux noms sans aucun marqueur de saison — ceux-ci sont
+    #    déjà traités au point 4 (et un « S02 » interdirait la comparaison au
+    #    numéro absolu).
+    bare = _bare_episode_numbers(release_name)
+    if bare:
+        attendus = {req_e}
+        if req_abs is not None and not _EXPLICIT_SEASON_RE.search(release_name):
+            attendus.add(req_abs)
+        if attendus & set(bare):
+            return True
+        return False  # un numéro est bien présent, mais ce n'est pas le nôtre
+
+    # 5 bis. Plage nue « 1017-1024 » (batchs d'animé sans marqueur de saison).
+    for m in _ANIME_BARE_RANGE_RE.finditer(release_name):
+        start, end = int(m.group(1)), int(m.group(2))
+        # Plage aberrante, ou deux années (« 2022-2023 ») prises pour des
+        # épisodes : on ignore plutôt que de trancher à tort.
+        if start > end or (1900 <= start <= 2100 and 1900 <= end <= 2100):
+            continue
+        attendus = {req_e}
+        if req_abs is not None:
+            attendus.add(req_abs)
+        if any(start <= v <= end for v in attendus):
+            return True
+
+    # 6. Aucune info détectée
+    return False if strict else None
+
+
+def select_episode_file(files: List[Dict], season, episode,
+                        name_key: str = "filename", size_key: str = "size") -> Optional[Dict]:
+    """Sélectionne le meilleur fichier vidéo d'une liste (season pack ou single).
+
+    Stratégie : exclut les samples, privilégie le match d'épisode exact,
+    sinon le plus gros fichier vidéo, sinon le plus gros fichier tout court.
+    """
+    video_extensions = ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.m4v', '.ts', '.webm')
+
+    if not files:
+        return None
+
+    candidates = [f for f in files if not is_sample_file(f.get(name_key, ""))] or list(files)
+    videos = [f for f in candidates if f.get(name_key, "").lower().endswith(video_extensions)] or candidates
+
+    if season is not None and episode is not None and len(videos) > 1:
+        matching = [f for f in videos if episode_matches(f.get(name_key, ""), season, episode) is True]
+        if matching:
+            return max(matching, key=lambda f: f.get(size_key, 0) or 0)
+
+    return max(videos, key=lambda f: f.get(size_key, 0) or 0)
