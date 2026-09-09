@@ -11,6 +11,17 @@ change à l'usage, pas le détail d'implémentation.
 
 CHANGELOG = [
     {
+        "version": "1.2.0",
+        "date": "2026-09-09",
+        "changes": [
+            "Nouvelle identité visuelle : dégradé cyan/indigo et nouveau logo, sur la page de configuration, la connexion admin et le tableau de bord (merci à razeN pour le logo !)",
+            "Wacustom repart de la base WAStream 3.9.1 (le fork suivait jusqu'ici la 3.8.2)",
+            "Fiabilité Idrix : délai entre les requêtes allongé pour réduire les erreurs, meilleure détection des vraies pages de contenu",
+            "Meilleure compatibilité des sources : repli automatique www/non-www lors de la synchronisation des domaines, en-têtes de requête plus cohérents",
+            "AllDebrid : sélection plus fiable du lien à débrider quand plusieurs choix sont proposés, et distinction entre un lien réellement mort et une simple erreur temporaire du service",
+        ],
+    },
+    {
         "version": "1.1.0",
         "date": "2026-08-21",
         "changes": [

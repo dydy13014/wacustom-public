@@ -2,7 +2,7 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -10,8 +10,13 @@ from selectolax.parser import HTMLParser
 
 from wastream.config.settings import settings
 from wastream.services.settings_manager import set_override
-from wastream.utils.http_client import http_client
+from wastream.utils.http_client import (
+    http_client,
+    is_rejected_source_page,
+    source_request_headers,
+)
 from wastream.utils.logger import scraper_logger
+from wastream.utils.urls import get_url_origin, get_www_url_variant
 
 
 # ===========================
@@ -20,10 +25,6 @@ from wastream.utils.logger import scraper_logger
 URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 DOMAIN_RE = re.compile(r"(?:www\.)?[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:/[^\s<>'\"]*)?", re.IGNORECASE)
 NEW_ADDRESS_RE = re.compile(r"\b(?:nouvelle|new)\s+adresse\b", re.IGNORECASE)
-BLOCKED_PAGE_RE = re.compile(
-    r"(?:just\s+a\s+moment|verify\s+you\s+are\s+human|cf[-_ ]?challenge|access\s+denied)",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -309,7 +310,7 @@ def _telegram_urls(value: str) -> List[str]:
 
 async def _fetch_telegram_page(channel_url: str, uses_messages: bool) -> str:
     last_error: Optional[Exception] = None
-    headers = {"User-Agent": "WAStream domain synchronizer"}
+    headers = source_request_headers()
     urls = _telegram_urls(channel_url)
     if uses_messages:
         urls.reverse()
@@ -355,10 +356,7 @@ def _movix_source_url_from_api(url: str) -> Optional[str]:
 
 
 def _is_rejected_page(url: str, body: str) -> bool:
-    path = (urlparse(url).path or "").lower()
-    if any(marker in path for marker in ("/login", "/signin", "/challenge", "/cdn-cgi/")):
-        return True
-    return bool(BLOCKED_PAGE_RE.search(body[:20000]))
+    return is_rejected_source_page(url, body)
 
 
 def _source_marker_present(source: DomainSource, response: httpx.Response) -> bool:
@@ -366,88 +364,126 @@ def _source_marker_present(source: DomainSource, response: httpx.Response) -> bo
     return source.domain_fragment in body or source.domain_fragment.replace("-", " ") in body
 
 
-async def _validate_regular_source(source: DomainSource, candidate: str) -> Tuple[bool, Optional[str], str]:
-    candidate_url = _with_scheme(candidate)
-    if _is_rejected_page(candidate_url, ""):
-        return False, None, "blocked_or_login_page"
+def _validation_roots(candidate: str) -> List[str]:
     candidate_root = _root_url(candidate)
     if not candidate_root:
+        return []
+    roots = [candidate_root]
+    alternate_root = get_url_origin(get_www_url_variant(candidate_root))
+    if alternate_root and alternate_root != candidate_root:
+        roots.append(alternate_root)
+    return roots
+
+
+def _can_try_alternate(reason: str) -> bool:
+    return reason not in {"HTTP_429", "API_HTTP_429"}
+
+
+async def _validate_with_www_fallback(
+    source: DomainSource,
+    candidate: str,
+    validator: Callable[
+        [httpx.AsyncClient, DomainSource, str],
+        Awaitable[Tuple[bool, Optional[str], str]],
+    ],
+) -> Tuple[bool, Optional[str], str]:
+    roots = _validation_roots(candidate)
+    if not roots:
         return False, None, "invalid_candidate_url"
 
     client_args = {
         "timeout": httpx.Timeout(float(settings.HTTP_TIMEOUT)),
         "follow_redirects": True,
         "verify": False,
-        "headers": {"User-Agent": "WAStream domain synchronizer"},
+        "headers": source_request_headers(),
     }
     if settings.PROXY_URL:
         client_args["proxy"] = settings.PROXY_URL
 
+    last_reason = "validation_failed"
     async with httpx.AsyncClient(**client_args) as client:
-        response = await client.get(candidate_root)
-        final_url = _root_url(str(response.url))
-        if not final_url or not _host_matches(final_url, source.domain_fragment):
-            return False, None, "redirected_to_unexpected_domain"
-        if response.status_code >= 400:
-            return False, None, f"HTTP_{response.status_code}"
-        if _is_rejected_page(str(response.url), response.text):
-            return False, None, "blocked_or_login_page"
-        if not _source_marker_present(source, response):
-            return False, None, "source_marker_not_found"
-        return True, final_url, "valid"
+        for candidate_root in roots:
+            try:
+                valid, validated_url, reason = await validator(
+                    client,
+                    source,
+                    candidate_root,
+                )
+            except httpx.RequestError as error:
+                valid, validated_url, reason = False, None, type(error).__name__
+            if valid:
+                return True, validated_url, reason
+            last_reason = reason
+            if not _can_try_alternate(reason):
+                break
+    return False, None, last_reason
+
+
+async def _validate_regular_source_once(
+    client: httpx.AsyncClient,
+    source: DomainSource,
+    candidate_root: str,
+) -> Tuple[bool, Optional[str], str]:
+    response = await client.get(candidate_root)
+    final_url = _root_url(str(response.url))
+    if not final_url or not _host_matches(final_url, source.domain_fragment):
+        return False, None, "redirected_to_unexpected_domain"
+    if response.status_code >= 400:
+        return False, None, f"HTTP_{response.status_code}"
+    if _is_rejected_page(str(response.url), response.text):
+        return False, None, "blocked_or_login_page"
+    if not _source_marker_present(source, response):
+        return False, None, "source_marker_not_found"
+    return True, final_url, "valid"
+
+
+async def _validate_regular_source(source: DomainSource, candidate: str) -> Tuple[bool, Optional[str], str]:
+    if _is_rejected_page(_with_scheme(candidate), ""):
+        return False, None, "blocked_or_login_page"
+    return await _validate_with_www_fallback(
+        source,
+        candidate,
+        _validate_regular_source_once,
+    )
+
+
+async def _validate_movix_source_once(
+    client: httpx.AsyncClient,
+    source: DomainSource,
+    candidate_root: str,
+) -> Tuple[bool, Optional[str], str]:
+    site_response = await client.get(candidate_root)
+    final_site_url = _root_url(str(site_response.url))
+    if not final_site_url or not _host_matches(final_site_url, source.domain_fragment):
+        return False, None, "redirected_to_unexpected_domain"
+    if site_response.status_code >= 400:
+        return False, None, f"HTTP_{site_response.status_code}"
+    if _is_rejected_page(str(site_response.url), site_response.text):
+        return False, None, "blocked_or_login_page"
+
+    parsed = urlparse(final_site_url)
+    api_host = f"api.{parsed.hostname.removeprefix('www.')}"
+    api_url = f"{parsed.scheme}://{api_host}/api/search"
+    api_headers = source_request_headers({
+        "Origin": final_site_url,
+        "Referer": f"{final_site_url}/",
+    })
+    response = await client.get(api_url, params={"title": "test"}, headers=api_headers)
+    final_api_url = str(response.url)
+    if response.status_code >= 400:
+        return False, None, f"API_HTTP_{response.status_code}"
+    if not _host_matches(final_api_url, source.domain_fragment):
+        return False, None, "api_redirected_to_unexpected_domain"
+    redirected_source_url = _movix_source_url_from_api(final_api_url)
+    return True, redirected_source_url or final_site_url, "valid"
 
 
 async def _validate_movix_source(source: DomainSource, candidate: str) -> Tuple[bool, Optional[str], str]:
-    candidate_root = _root_url(candidate)
-    if not candidate_root:
-        return False, None, "invalid_candidate_url"
-
-    client_args = {
-        "timeout": httpx.Timeout(float(settings.HTTP_TIMEOUT)),
-        "follow_redirects": True,
-        "verify": False,
-        "headers": {
-            "User-Agent": "WAStream domain synchronizer",
-            "Origin": candidate_root,
-            "Referer": f"{candidate_root}/",
-        },
-    }
-    if settings.PROXY_URL:
-        client_args["proxy"] = settings.PROXY_URL
-
-    async with httpx.AsyncClient(**client_args) as client:
-        site_response = await client.get(candidate_root)
-        final_site_url = _root_url(str(site_response.url))
-        if not final_site_url or not _host_matches(
-            final_site_url,
-            source.domain_fragment,
-        ):
-            return False, None, "redirected_to_unexpected_domain"
-        if site_response.status_code >= 400:
-            return False, None, f"HTTP_{site_response.status_code}"
-        if _is_rejected_page(str(site_response.url), site_response.text):
-            return False, None, "blocked_or_login_page"
-
-        parsed = urlparse(final_site_url)
-        api_host = f"api.{parsed.hostname.removeprefix('www.')}"
-        api_url = f"{parsed.scheme}://{api_host}/api/search"
-        api_headers = {
-            "User-Agent": "WAStream domain synchronizer",
-            "Origin": final_site_url,
-            "Referer": f"{final_site_url}/",
-        }
-        response = await client.get(
-            api_url,
-            params={"title": "test"},
-            headers=api_headers,
-        )
-        final_api_url = str(response.url)
-        if response.status_code >= 400:
-            return False, None, f"API_HTTP_{response.status_code}"
-        if not _host_matches(final_api_url, source.domain_fragment):
-            return False, None, "api_redirected_to_unexpected_domain"
-        redirected_source_url = _movix_source_url_from_api(final_api_url)
-        return True, redirected_source_url or final_site_url, "valid"
+    return await _validate_with_www_fallback(
+        source,
+        candidate,
+        _validate_movix_source_once,
+    )
 
 
 async def _validate_candidate(source: DomainSource, candidate: str) -> Tuple[bool, Optional[str], str]:
@@ -559,7 +595,7 @@ def request_source_recheck(source_name: str) -> str:
 
     now = time.time()
     last_attempt = _sync_state.last_recheck_at.get(source_name, 0)
-    delay = max(1, settings.DOMAIN_SYNC_HEALTH_ERROR_RECHECK_DELAY_SECONDS)
+    delay = max(1, settings.DOMAIN_SYNC_HEALTH_ERROR_RECHECK_DELAY)
     if now - last_attempt < delay:
         return "cooldown"
 
@@ -590,7 +626,7 @@ def get_domain_sync_status() -> Dict[str, object]:
         "stop_requested": _sync_state.stop_requested,
         "interval": settings.DOMAIN_SYNC_INTERVAL,
         "health_recheck_enabled": settings.DOMAIN_SYNC_RECHECK_ON_HEALTH_ERROR,
-        "health_recheck_delay_seconds": settings.DOMAIN_SYNC_HEALTH_ERROR_RECHECK_DELAY_SECONDS,
+        "health_recheck_delay_seconds": settings.DOMAIN_SYNC_HEALTH_ERROR_RECHECK_DELAY,
         "last_run": _sync_state.last_run,
         "last_full_sync": _sync_state.last_full_sync,
         "pending_rechecks": sorted(_pending_rechecks),

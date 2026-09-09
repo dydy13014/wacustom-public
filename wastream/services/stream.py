@@ -61,13 +61,13 @@ from wastream.utils.tasks import lancer_tache
 # ===========================
 # Playback Sentinels
 # ===========================
-PLAYBACK_SENTINELS = ("LINK_DOWN", "RETRY_ERROR", "FATAL_ERROR", "LINK_UNCACHED")
+PLAYBACK_SENTINELS = ("LINK_DOWN", "LINK_SERVICE_DOWN", "LINK_UNSUPPORTED", "RETRY_ERROR", "FATAL_ERROR", "LINK_UNCACHED")
 
 
 # ===========================
 # Playback Sentinels
 # ===========================
-PLAYBACK_SENTINELS = ("LINK_DOWN", "RETRY_ERROR", "FATAL_ERROR", "LINK_UNCACHED")
+PLAYBACK_SENTINELS = ("LINK_DOWN", "LINK_SERVICE_DOWN", "LINK_UNSUPPORTED", "RETRY_ERROR", "FATAL_ERROR", "LINK_UNCACHED")
 
 
 # Si le verrou anti-doublon (SearchLock) n'est pas obtenu après
@@ -1537,11 +1537,11 @@ class StreamService:
     def _build_link_response(self, direct_link: Optional[str]):
         if direct_link and direct_link not in PLAYBACK_SENTINELS:
             return RedirectResponse(url=direct_link, status_code=302)
-        elif direct_link == "LINK_DOWN":
+        elif direct_link in ("LINK_DOWN", "LINK_UNSUPPORTED"):
             return FileResponse("wastream/public/link_down.mp4")
         elif direct_link == "LINK_UNCACHED":
             return FileResponse("wastream/public/uncached.mp4")
-        elif direct_link == "RETRY_ERROR":
+        elif direct_link in ("RETRY_ERROR", "LINK_SERVICE_DOWN"):
             return FileResponse("wastream/public/retry_error.mp4")
         else:
             return FileResponse("wastream/public/fatal_error.mp4")

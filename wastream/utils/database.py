@@ -20,7 +20,7 @@ from wastream.utils.urls import DOMAIN_ALIASES, canonicalize_url
 _database_options = {}
 if settings.DATABASE_TYPE == "sqlite":
     _database_options["timeout"] = max(
-        1, int(settings.DATABASE_BUSY_TIMEOUT_SECONDS)
+        1, int(settings.DATABASE_BUSY_TIMEOUT)
     )
 database = Database(settings.get_database_url(), **_database_options)
 
@@ -50,7 +50,7 @@ def _is_retryable_database_error(error: Exception) -> bool:
 async def run_database_operation(
         operation: Callable[[], Awaitable[T]], operation_name: str) -> T:
     max_attempts = max(1, int(settings.DATABASE_RETRY_MAX_ATTEMPTS))
-    base_delay = max(0.05, float(settings.DATABASE_RETRY_DELAY_SECONDS))
+    base_delay = max(0.05, float(settings.DATABASE_RETRY_DELAY))
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -290,7 +290,7 @@ async def setup_database():
 
         if settings.DATABASE_TYPE == "sqlite":
             busy_timeout_ms = max(
-                1, int(settings.DATABASE_BUSY_TIMEOUT_SECONDS)
+                1, int(settings.DATABASE_BUSY_TIMEOUT)
             ) * 1000
             await database.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             await database.execute("PRAGMA journal_mode=WAL")

@@ -6,7 +6,7 @@
     <title>{{ADDON_NAME}} - Configuration</title>
     <meta property="og:title" content="{{ADDON_NAME}}" />
     <meta property="og:description" content="Stremio addon to convert DDL to streams via debrid services" />
-    <meta name="theme-color" content="#ff7a1c">
+    <meta name="theme-color" content="#22d3ee">
     <link rel="icon" href="/static/wastream-logo.png">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/themes/dark.css" />
     <script type="module" src="https://cdn.jsdelivr.net/npm/@shoelace-style/shoelace@2.20.1/cdn/shoelace-autoloader.js"></script>
@@ -37,10 +37,17 @@
             --text-secondary: #a1a1aa;
             --text-muted: #71717a;
 
-            --accent-primary: #ff7a1c;
-            --accent-primary-hover: #e86a10;
-            --accent-primary-subtle: rgba(255, 122, 28, 0.14);
-            --accent-primary-glow: rgba(255, 122, 28, 0.18);
+            --accent-primary: #22d3ee;
+            --accent-primary-hover: #06b6d4;
+            --accent-primary-subtle: rgba(34, 211, 238, 0.14);
+            --accent-primary-glow: rgba(34, 211, 238, 0.18);
+            --accent-primary-dark: #28008c;
+
+            --accent-secondary: #6366f1;
+            --accent-secondary-hover: #4f46e5;
+            --accent-secondary-subtle: rgba(99, 102, 241, 0.14);
+
+            --accent-gradient: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
 
             --accent-success: #10b981;
             --accent-success-hover: #059669;
@@ -97,7 +104,7 @@
             /* Halos discrets (orange en haut a droite, vert en haut a gauche) :
                cassent l'aplat sombre sans nuire a la lisibilite. */
             background:
-                radial-gradient(1100px 480px at 85% -10%, rgba(255, 122, 28, .08), transparent 60%),
+                radial-gradient(1100px 480px at 85% -10%, rgba(34, 211, 238, .08), transparent 60%),
                 radial-gradient(900px 480px at -10% 10%, rgba(16, 185, 129, .05), transparent 60%),
                 var(--bg-primary);
             background-attachment: fixed;
@@ -364,7 +371,7 @@
         }
 
         .hero-title span {
-            background: linear-gradient(135deg, var(--accent-primary), #fb923c);
+            background: var(--accent-gradient);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
@@ -650,7 +657,7 @@
         }
 
         sl-select::part(tag__base) {
-            background: var(--accent-primary);
+            background: var(--accent-primary-dark);
             color: white;
             border: none;
             border-radius: var(--radius-sm);
@@ -1106,7 +1113,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            background: var(--accent-primary);
+            background: var(--accent-primary-dark);
             border: none;
             border-radius: var(--radius-md);
             color: white;
@@ -1187,7 +1194,7 @@
             align-items: center;
             justify-content: center;
             gap: 10px;
-            background: linear-gradient(135deg, var(--accent-success), var(--accent-success-hover));
+            background: var(--accent-gradient);
             border: none;
             border-radius: var(--radius-lg);
             color: white;
@@ -1196,13 +1203,13 @@
             font-family: inherit;
             cursor: pointer;
             transition: all var(--transition-base);
-            box-shadow: 0 4px 20px rgba(16, 185, 129, 0.3);
+            box-shadow: 0 4px 20px rgba(34, 211, 238, 0.3);
             margin-top: 32px;
         }
 
         .btn:hover:not(:disabled) {
             transform: translateY(-2px);
-            box-shadow: 0 8px 30px rgba(16, 185, 129, 0.4);
+            box-shadow: 0 8px 30px rgba(34, 211, 238, 0.4);
         }
 
         .btn:disabled {
