@@ -179,7 +179,7 @@ SETTINGS_LAYOUT = [
     # les cles (et l'identifiant Lumio) sont fournies par chaque utilisateur.
     ("Trackers Torznab", ["YGGREBORN_URL", "TR4KER_URL", "TORR9_URL", "C411_URL", "V3X_URL"]),
     ("Trackers UNIT3D", ["GEMINI_URL", "GENERATIONFREE_URL"]),
-    ("Zilean / Nyaa", ["ZILEAN_URL", "NYAA_URL"]),
+    ("Zilean / Nyaa / AIOSources", ["ZILEAN_URL", "NYAA_URL", "AIOSOURCES_URL"]),
     ("Lumio", ["LUMIO_RATE_LIMIT_PAUSE"]),
     ("Database resilience", ["DATABASE_RETRY_MAX_ATTEMPTS", "DATABASE_RETRY_DELAY"]),
     ("Kitsu / Anime", ["DARKIMOVIX_KITSU_TMDB_MAPPING", "KITSU_IMDB_OVERRIDE"]),

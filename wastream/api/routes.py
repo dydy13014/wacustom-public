@@ -2452,7 +2452,7 @@ async def admin_get_settings(admin_token: Optional[str] = Cookie(None)):
         # Instance publique : URLs seulement, les cles sont par utilisateur
         "YGGREBORN_URL", "TR4KER_URL", "TORR9_URL", "C411_URL", "V3X_URL",
         "GEMINI_URL", "GENERATIONFREE_URL",
-        "ZILEAN_URL"
+        "ZILEAN_URL", "AIOSOURCES_URL"
     ]
     
     settings_dict = {}
@@ -2482,7 +2482,7 @@ async def admin_save_settings(
         # Instance publique : URLs seulement, les cles sont par utilisateur
         "YGGREBORN_URL", "TR4KER_URL", "TORR9_URL", "C411_URL", "V3X_URL",
         "GEMINI_URL", "GENERATIONFREE_URL",
-        "ZILEAN_URL"
+        "ZILEAN_URL", "AIOSOURCES_URL"
     ]
 
     from wastream.utils.database import database
