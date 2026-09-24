@@ -529,6 +529,13 @@ class StreamService:
             stream_logger.error(f"TMDB metadata failed for {media_info['imdb_id']}")
             return []
 
+        # get_enhanced_metadata()/get_metadata() ne reportent jamais l'IMDB id
+        # dans le dict retourne (seulement title/year/type/enhanced) -- or
+        # AIOSourcesScraper/LumioScraper/etc. lisent metadata.get("imdb_id")
+        # pour construire leur requete et s'arretent silencieusement sans lui,
+        # meme quand cet id a servi a resoudre les metadonnees TMDB juste au-dessus.
+        metadata["imdb_id"] = media_info["imdb_id"]
+
         search_config = {
             **config,
             "enable_full_season": should_enable_full_season(config)
