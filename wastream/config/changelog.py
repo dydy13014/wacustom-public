@@ -11,6 +11,20 @@ change à l'usage, pas le détail d'implémentation.
 
 CHANGELOG = [
     {
+        "version": "1.4.0",
+        "date": "2026-09-26",
+        "changes": [
+            "AIOSources et Lumio ne remontaient plus aucun résultat depuis un moment, à cause d'un bug silencieux dans la transmission de l'identifiant IMDB aux sources — corrigé, ces deux sources fonctionnent de nouveau normalement",
+            "Recherche plus précise sur les trackers à clé (Tr4ker, C411, Torr9, YggReborn, V3X) : la correspondance se fait désormais par identifiant exact (IMDB/TMDB/TheTVDB) plutôt que par simple recherche de mots-clés, ce qui réduit les faux résultats sur les titres ambigus — chaque tracker est sondé automatiquement pour savoir quel identifiant il accepte, sans réglage à faire",
+            "Zilean : passage à son vrai système de recherche (identique à celui des autres trackers) — la taille des fichiers, qui s'affichait comme \"Inconnu\" sur tous les résultats, est désormais correcte, et la recherche se fait aussi par identifiant IMDB exact",
+            "Nombre de sources (seeders) et de leechers désormais affiché sur les résultats torrent quand l'information est disponible (trackers à clé, Nyaa), utile pour choisir la source la plus rapide",
+            "Nyaa : badges \"Trusted\" et \"Remake\" affichés sur les résultats, quand le tracker les signale comme tels",
+            "Correction : les animes cherchés normalement dans Stremio (hors catalogue \"Anime\" dédié) ne recevaient jamais de résultats Nyaa — Nyaa ne cherchait que dans sa catégorie dramas/variétés pour ce type de recherche, jamais dans sa catégorie Anime",
+            "Correction : le logo affiché par Stremio à l'installation de l'addon était encore celui de WAStream (projet d'origine) au lieu du logo Wacustom",
+            "Correction : la description de l'addon (visible à l'installation dans Stremio) ne mentionnait que le DDL, alors que Wacustom gère aussi les torrents",
+        ],
+    },
+    {
         "version": "1.3.0",
         "date": "2026-09-16",
         "changes": [

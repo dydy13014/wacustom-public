@@ -414,6 +414,26 @@ class StreamService:
             if source_line:
                 description_parts.append(source_line)
 
+            seeders = result.get("seeders")
+            peers = result.get("peers")
+            if seeders is not None or peers is not None:
+                health_parts = []
+                if seeders is not None:
+                    health_parts.append(f"🌱 {seeders}")
+                if peers is not None:
+                    health_parts.append(f"🔻 {peers}")
+                description_parts.append(" ".join(health_parts))
+
+            badges = []
+            if result.get("freeleech"):
+                badges.append("🆓 Freeleech")
+            if result.get("trusted"):
+                badges.append("✅ Trusted")
+            if result.get("remake"):
+                badges.append("⚠️ Remake")
+            if badges:
+                description_parts.append(" ".join(badges))
+
             if display_name and display_name != "Unknown":
                 description_parts.append(f"📁 {display_name}")
 
@@ -449,12 +469,25 @@ class StreamService:
             else:  # ddl_first
                 stream_type_priority = 1 if is_torrent else 0
 
+            # bingeGroup (spec Stremio) : meme identifiant source+resolution
+            # d'un episode a l'autre pour que Stremio reselectionne
+            # automatiquement le meme choix a l'episode suivant plutot que de
+            # redemander a chaque fois.
+            binge_source = (result.get("source") or "wacustom").lower().replace(" ", "-")
+            binge_resolution = (resolution or "unknown").lower()
+            binge_group = f"wacustom-{binge_source}-{binge_resolution}"
+
+            behavior_hints = {
+                "filename": display_name,
+                "bingeGroup": binge_group,
+            }
+            if size_bytes > 0:
+                behavior_hints["videoSize"] = size_bytes
+
             streams.append({
                 "name": stream_name,
                 "description": "\r\n".join(description_parts),
-                "behaviorHints": {
-                    "filename": display_name
-                },
+                "behaviorHints": behavior_hints,
                 "url": playback_url,
                 "_sort_values": {
                     "cached": 0 if cache_status == "cached" else 1,
@@ -535,6 +568,16 @@ class StreamService:
         # pour construire leur requete et s'arretent silencieusement sans lui,
         # meme quand cet id a servi a resoudre les metadonnees TMDB juste au-dessus.
         metadata["imdb_id"] = media_info["imdb_id"]
+        # tmdb_id existe deja mais reste enterre dans metadata["enhanced"] --
+        # requis par certains trackers Torznab (C411/Tr4ker/V3X, cf. leurs
+        # caps) pour une recherche par ID exact (t=movie/t=tvsearch) plutot
+        # qu'en texte libre. Absent si get_enhanced_metadata a echoue (repli
+        # get_metadata, pas de cle "enhanced").
+        metadata["tmdb_id"] = metadata.get("enhanced", {}).get("tmdb_id")
+        # tvdbid : premier choix de Tr4ker pour t=tvsearch (cf. caps), absent
+        # pour les films (pas de notion de TVDB) -- .get() renvoie None sans
+        # erreur dans ce cas, la recherche par ID retombe alors sur imdbid.
+        metadata["tvdb_id"] = metadata.get("enhanced", {}).get("tvdb_id")
 
         search_config = {
             **config,
@@ -1409,6 +1452,56 @@ class StreamService:
             else:
                 coro = self._search_source_with_cache(
                     "nyaa", content_type, _search_nyaa_multi_title,
+                    title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
+            tasks_with_sources.append(("nyaa", coro))
+
+        # Nyaa Anime : un vrai anime (content_name == "anime", detecte via
+        # genre TMDB 16 + mot-cle 210024 dans tmdb.py) ne recevait jusqu'ici
+        # AUCUN resultat Nyaa quand il est cherche via un ID IMDB/TVDB
+        # classique (_search_anime -> ici), car le bloc Live Action ci-dessus
+        # exclut explicitement "anime" (categorie 4_0 = dramas/variete, pas
+        # les vrais animes) -- seul le catalogue anime Kitsu de Stremio
+        # (_handle_kitsu_request) interrogeait Nyaa en categorie Anime
+        # (1_0). Meme strategie multi-titres que Live Action (titres
+        # alternatifs/romaji), simplement en categorie Anime.
+        if (
+            "nyaa" in supported_sources
+            and content_name == "anime"
+            and metadata
+            and self._is_source_allowed_for_content("nyaa", content_name, config)
+        ):
+            candidate_titles = [title]
+            for extra_title in (metadata.get("nyaa_candidate_titles") or [])[:5]:
+                if extra_title and extra_title not in candidate_titles:
+                    candidate_titles.append(extra_title)
+
+            async def _search_nyaa_anime_multi_title():
+                results_lists = await asyncio.gather(
+                    *(nyaa_scraper.search(t, year, metadata, season, episode, config, category="1_0")
+                      for t in candidate_titles),
+                    return_exceptions=True
+                )
+                seen_hashes = set()
+                merged = []
+                for r in results_lists:
+                    if not isinstance(r, list):
+                        continue
+                    for item in r:
+                        infohash = item.get("infohash")
+                        if infohash and infohash in seen_hashes:
+                            continue
+                        if infohash:
+                            seen_hashes.add(infohash)
+                        merged.append(item)
+                return merged
+
+            if use_episode_cache:
+                coro = self._search_source_with_cache(
+                    "nyaa", content_type, _search_nyaa_anime_multi_title,
+                    title, year, season, episode, metadata, use_episode_key=True, filter_episodes=False)
+            else:
+                coro = self._search_source_with_cache(
+                    "nyaa", content_type, _search_nyaa_anime_multi_title,
                     title, year, metadata=metadata, use_episode_key=False, filter_episodes=False)
             tasks_with_sources.append(("nyaa", coro))
 

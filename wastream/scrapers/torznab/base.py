@@ -1,4 +1,5 @@
 import asyncio
+import time
 import xml.etree.ElementTree as ET
 import re
 from typing import List, Dict, Optional, Tuple
@@ -58,38 +59,162 @@ def _is_relevant(title: str, release_name: str) -> bool:
     return (matched / len(title_tokens)) >= _MIN_RELEVANCE_RATIO
 
 
+_KNOWN_ID_PARAMS = ("imdbid", "tmdbid", "tvdbid")
+
+
+def _parse_caps_id_params(caps_xml: bytes) -> Tuple[List[str], List[str]]:
+    """Extrait les identifiants exacts (imdbid/tmdbid/tvdbid) qu'un tracker
+    annonce supporter dans sa reponse ?t=caps, pour t=movie et t=tvsearch.
+    Renvoie ([] , []) si le XML est invalide ou si le mode n'est pas
+    `available="yes"` -- fail-open vers la recherche texte, jamais une
+    exception qui casserait le scraper."""
+    try:
+        root = ET.fromstring(caps_xml)
+    except ET.ParseError:
+        return [], []
+
+    def extract(tag: str) -> List[str]:
+        node = root.find(f".//{tag}")
+        if node is None or node.attrib.get("available") != "yes":
+            return []
+        supported = node.attrib.get("supportedParams", "")
+        # Ordre de declaration du tracker preserve (sert d'ordre de preference).
+        return [p for p in supported.split(",") if p in _KNOWN_ID_PARAMS]
+
+    return extract("movie-search"), extract("tv-search")
+
+
+class _CapsCache:
+    """Cache en memoire des capacites Torznab par URL de tracker. Succes mis
+    en cache longtemps (les capacites d'un tracker changent rarement) ; echec/
+    vide mis en cache brievement pour reessayer bientot sans matraquer un
+    tracker temporairement indisponible a chaque recherche."""
+    _entries: Dict[str, Tuple[float, List[str], List[str]]] = {}
+    _locks: Dict[str, asyncio.Lock] = {}
+    _TTL_SUCCESS = 86400
+    _TTL_EMPTY = 600
+
+    @classmethod
+    async def get(cls, name: str, url: str, api_key: str, auth_type: str) -> Tuple[List[str], List[str]]:
+        now = time.monotonic()
+        cached = cls._entries.get(url)
+        if cached and now - cached[0] < (cls._TTL_SUCCESS if (cached[1] or cached[2]) else cls._TTL_EMPTY):
+            return cached[1], cached[2]
+
+        lock = cls._locks.setdefault(url, asyncio.Lock())
+        async with lock:
+            cached = cls._entries.get(url)
+            if cached and now - cached[0] < (cls._TTL_SUCCESS if (cached[1] or cached[2]) else cls._TTL_EMPTY):
+                return cached[1], cached[2]
+
+            movie_params, tv_params = await cls._fetch(name, url, api_key, auth_type)
+            cls._entries[url] = (now, movie_params, tv_params)
+            return movie_params, tv_params
+
+    @staticmethod
+    async def _fetch(name: str, url: str, api_key: str, auth_type: str) -> Tuple[List[str], List[str]]:
+        headers = {"User-Agent": "WAStream/1.0"}
+        params = {"t": "caps"}
+        if api_key:
+            if auth_type == "header":
+                headers["Authorization"] = f"Bearer {api_key}"
+            else:
+                params["apikey"] = api_key
+        try:
+            response = await http_client.get(url, headers=headers, params=params, timeout=10)
+            if response.status_code != 200:
+                scraper_logger.debug(f"[{name}] caps HTTP {response.status_code}, recherche texte par defaut")
+                return [], []
+            movie_params, tv_params = _parse_caps_id_params(response.content)
+            if movie_params or tv_params:
+                scraper_logger.debug(
+                    f"[{name}] caps: movie={movie_params or '-'} tv={tv_params or '-'}"
+                )
+            return movie_params, tv_params
+        except Exception as e:
+            scraper_logger.debug(f"[{name}] caps fetch failed ({type(e).__name__}), recherche texte par defaut")
+            return [], []
+
+
 class BaseTorznab:
-    def __init__(self, name: str, url: str, api_key: str, auth_type: str = "query"):
+    def __init__(self, name: str, url: str, api_key: str, auth_type: str = "query",
+                 movie_id_params: Optional[List[str]] = None,
+                 tv_id_params: Optional[List[str]] = None,
+                 require_api_key: bool = True):
         self.name = name
         self.url = normalize_tracker_url(name, url)
         self.api_key = api_key
         self.auth_type = auth_type  # "query" or "header"
+        # Certains trackers Torznab (Zilean) n'exigent aucune authentification
+        # (endpoint public, AllowAnonymous cote serveur) -- sans ce flag, le
+        # scraper serait toujours saute faute de cle API a fournir. Tous les
+        # autres trackers de ce fork public restent a cle utilisateur
+        # obligatoire (chacun apporte la sienne, cf. _UserKeyTracker).
+        self.require_api_key = require_api_key
+        # Override manuel optionnel. Si non fourni (None), les identifiants
+        # exacts supportes par ce tracker sont auto-decouverts et mis en cache
+        # via son endpoint ?t=caps (cf. _CapsCache) -- pas besoin de les
+        # maintenir a la main par tracker, ni de les deviner si le tracker
+        # change un jour son implementation Torznab.
+        self._movie_id_params_override = movie_id_params
+        self._tv_id_params_override = tv_id_params
+
+    @staticmethod
+    def _metadata_value(metadata: Dict, id_param: str) -> Optional[str]:
+        key = {"imdbid": "imdb_id", "tmdbid": "tmdb_id", "tvdbid": "tvdb_id"}.get(id_param)
+        return metadata.get(key) if key else None
 
     async def search(self, title: str, year: Optional[str] = None, metadata: Optional[Dict] = None,
                      season: Optional[str] = None, episode: Optional[str] = None,
                      config: Optional[Dict] = None) -> List[Dict]:
-        if not self.api_key or not self.url:
+        if not self.url or (self.require_api_key and not self.api_key):
             scraper_logger.debug(f"[{self.name}] URL or API key not configured, skipping")
             return []
 
+        is_tv = bool(season and episode)
+        metadata = metadata or {}
+
+        if self._movie_id_params_override is not None or self._tv_id_params_override is not None:
+            movie_id_params = self._movie_id_params_override or []
+            tv_id_params = self._tv_id_params_override or []
+        else:
+            movie_id_params, tv_id_params = await _CapsCache.get(
+                self.name, self.url, self.api_key, self.auth_type
+            )
+
+        id_prefs = tv_id_params if is_tv else movie_id_params
+        id_param = id_value = None
+        for candidate in id_prefs:
+            value = self._metadata_value(metadata, candidate)
+            if value:
+                id_param, id_value = candidate, value
+                break
+
         # 1. Formulate search query
         search_query = title
-        if season and episode:
-            # Saison seule dans la requête, pas l'épisode : certains trackers
-            # (constaté sur C411, 2026-07-20) ne remontent JAMAIS un pack de
-            # saison ("...S03.VFF...") si la requête contient "S03E01" — leur
-            # moteur de recherche fait un matching textuel qui ne trouve pas
-            # "E01" dans un nom de pack, donc le pack n'apparaît même pas dans
-            # les résultats. Le filtrage client (episode_matches, plus bas)
-            # sait déjà repérer un pack de la bonne saison ou l'épisode exact
-            # dans un ensemble de résultats plus large — inutile de
-            # sur-préciser la requête envoyée au tracker.
-            try:
-                search_query += f" S{int(season):02d}"
-            except (ValueError, TypeError):
-                search_query += f" S{season}"
-        elif year:
-            search_query += f" {year}"
+        if id_param:
+            # Recherche par ID exact (t=movie/t=tvsearch) : season/ep passent
+            # en parametres dedies, q reste un simple filet de securite pour
+            # les trackers qui font quand meme un matching texte en plus de l'ID.
+            mode = "tvsearch" if is_tv else "movie"
+        else:
+            mode = "search"
+            if season and episode:
+                # Saison seule dans la requête, pas l'épisode : certains trackers
+                # (constaté sur C411, 2026-07-20) ne remontent JAMAIS un pack de
+                # saison ("...S03.VFF...") si la requête contient "S03E01" — leur
+                # moteur de recherche fait un matching textuel qui ne trouve pas
+                # "E01" dans un nom de pack, donc le pack n'apparaît même pas dans
+                # les résultats. Le filtrage client (episode_matches, plus bas)
+                # sait déjà repérer un pack de la bonne saison ou l'épisode exact
+                # dans un ensemble de résultats plus large — inutile de
+                # sur-préciser la requête envoyée au tracker.
+                try:
+                    search_query += f" S{int(season):02d}"
+                except (ValueError, TypeError):
+                    search_query += f" S{season}"
+            elif year:
+                search_query += f" {year}"
 
         # 2. Build request
         # La cle passe par `params` plutot que par une URL assemblee a la main :
@@ -101,13 +226,31 @@ class BaseTorznab:
         headers = {
             "User-Agent": "WAStream/1.0"
         }
-        params = {"t": "search", "q": search_query}
-        if self.auth_type == "header":
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        else:
-            params["apikey"] = self.api_key
+        # limit proche du max habituel (100) : recupere davantage de resultats
+        # en un seul appel plutot que de se limiter au defaut du tracker
+        # (ex. 25 sur C411) -- pas de vraie pagination multi-pages, une
+        # recherche par titre precis depasse rarement 100 releases.
+        params = {"t": mode, "q": search_query, "limit": "100"}
+        if id_param:
+            params[id_param] = str(id_value)
+            if is_tv:
+                # Season seul, jamais "ep" : verifie en direct sur C411 le
+                # 2026-09-25, le parametre "ep" fait systematiquement remonter
+                # 0 resultat (meme torrent trouve sans lui) -- identique au
+                # piège deja documente plus bas pour la recherche texte libre.
+                # Le filtrage client (episode_matches) se charge de retrouver
+                # le bon episode dans le pack de saison remonte.
+                params["season"] = str(season)
+        if self.api_key:
+            if self.auth_type == "header":
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            else:
+                params["apikey"] = self.api_key
 
-        scraper_logger.debug(f"[{self.name}] Querying: {search_query}")
+        if id_param:
+            scraper_logger.debug(f"[{self.name}] Querying by {id_param}={id_value} (t={mode})")
+        else:
+            scraper_logger.debug(f"[{self.name}] Querying: {search_query}")
 
         try:
             response = await http_client.get(self.url, headers=headers, params=params)
@@ -128,6 +271,20 @@ class BaseTorznab:
 
             # 3. Parse XML response
             root = ET.fromstring(response.content)
+
+            # La spec Torznab autorise un HTTP 200 avec un <error> a la racine
+            # au lieu du <channel> habituel (cle invalide, parametre incorrect,
+            # rate limit...) -- sans ce controle, une clé API expirée remonte
+            # silencieusement comme "0 resultat", indiscernable d'un titre
+            # reellement absent du tracker.
+            error_node = root if root.tag == "error" else root.find(".//error")
+            if error_node is not None:
+                scraper_logger.error(
+                    f"[{self.name}] Torznab error {error_node.attrib.get('code', '?')}: "
+                    f"{error_node.attrib.get('description', 'no description')}"
+                )
+                return []
+
             results = []
 
             for item in root.findall(".//item"):
@@ -145,6 +302,9 @@ class BaseTorznab:
                 # Parse custom Torznab attributes
                 size = 0
                 infohash = None
+                seeders = None
+                peers = None
+                freeleech = False
                 for attr in item.findall(".//{http://torznab.com/schemas/2015/feed}attr"):
                     attr_name = attr.attrib.get("name")
                     attr_value = attr.attrib.get("value")
@@ -155,9 +315,45 @@ class BaseTorznab:
                             size = int(attr_value)
                         except ValueError:
                             pass
+                    elif attr_name == "seeders":
+                        try:
+                            seeders = int(attr_value)
+                        except (ValueError, TypeError):
+                            pass
+                    elif attr_name == "peers":
+                        try:
+                            peers = int(attr_value)
+                        except (ValueError, TypeError):
+                            pass
+                    elif attr_name == "downloadvolumefactor":
+                        # 0.0 = freeleech (le telechargement ne compte pas dans
+                        # le ratio du tracker prive) -- utile pour prioriser un
+                        # torrent equivalent sans risquer le ratio de l'utilisateur.
+                        try:
+                            freeleech = float(attr_value) == 0.0
+                        except (ValueError, TypeError):
+                            pass
 
                 # Extract magnet or enclosure link
                 enclosure = item.find("enclosure")
+
+                # Certains trackers (Zilean, verifie le 2026-09-25) ne mettent
+                # pas la taille en torznab:attr comme C411/Tr4ker/V3X/YggReborn,
+                # mais dans l'element RSS brut <size> et/ou enclosure@length --
+                # repli sur ces deux sources avant d'abandonner a "Unknown".
+                if size == 0:
+                    size_node = item.find("size")
+                    if size_node is not None and size_node.text:
+                        try:
+                            size = int(size_node.text)
+                        except ValueError:
+                            pass
+                if size == 0 and enclosure is not None:
+                    try:
+                        size = int(enclosure.attrib.get("length", 0))
+                    except ValueError:
+                        pass
+
                 torrent_url = None
                 if enclosure is not None:
                     torrent_url = enclosure.attrib.get("url")
@@ -223,7 +419,11 @@ class BaseTorznab:
                 if not display_name:
                     display_name = release_name
 
-                # Construct magnet link if we have infohash
+                # Contrairement a Wacustom (self-host), ce fork public n'a pas
+                # de mecanisme de recuperation du vrai fichier .torrent avec
+                # passkey (torrent_files) -- chaque utilisateur apportant sa
+                # propre cle, ce cache serait par utilisateur, pas partageable.
+                # Le magnet nu reste donc la seule option ici.
                 magnet_link = f"magnet:?xt=urn:btih:{infohash}"
 
                 result = {
@@ -236,8 +436,13 @@ class BaseTorznab:
                     "hoster": "Torrent",
                     "size": size_str,
                     "display_name": display_name,
-                    "model_type": "torrent"
+                    "model_type": "torrent",
+                    "freeleech": freeleech,
                 }
+                if seeders is not None:
+                    result["seeders"] = seeders
+                if peers is not None:
+                    result["peers"] = peers
 
                 if season:
                     result["season"] = str(season)
