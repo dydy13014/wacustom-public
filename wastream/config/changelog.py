@@ -11,6 +11,14 @@ change à l'usage, pas le détail d'implémentation.
 
 CHANGELOG = [
     {
+        "version": "1.4.1",
+        "date": "2026-10-01",
+        "changes": [
+            "Correction : un titre trop récent pour avoir une fiche IMDB complète sur TMDB (cas fréquent avec les sorties très fraîches) faisait échouer toute la recherche de flux, alors que le contenu existait bien chez les sources — ça fonctionne maintenant normalement",
+            "Correction : les titres avec une apostrophe (« L'Arène », « D'Artagnan »...) pouvaient voir de bons résultats rejetés à tort sur les trackers à clé lors d'une recherche par identifiant exact",
+        ],
+    },
+    {
         "version": "1.4.0",
         "date": "2026-09-26",
         "changes": [
